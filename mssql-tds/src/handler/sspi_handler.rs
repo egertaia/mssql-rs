@@ -67,8 +67,7 @@ pub(crate) struct SspiAuthHandler {
     security_context: Box<dyn SecurityContext>,
     /// Current authentication state
     state: SspiAuthState,
-    /// Target SPN (for debugging/logging)
-    #[allow(dead_code)] // read via target_spn() in tests
+    /// Target SPN, recorded on the login's connect stage.
     target_spn: String,
 }
 
@@ -202,7 +201,6 @@ impl SspiAuthHandler {
     }
 
     /// Returns the target SPN being used for authentication.
-    #[cfg(test)]
     pub(crate) fn target_spn(&self) -> &str {
         &self.target_spn
     }

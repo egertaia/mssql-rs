@@ -464,8 +464,10 @@ fn convert_spn_to_gssapi_format(spn: &str) -> String {
         let service = &spn[..slash_pos];
         let rest = &spn[slash_pos + 1..];
 
-        // Extract host (everything before the colon, or the whole string if no colon)
-        let host = if let Some(colon_pos) = rest.find(':') {
+        // Extract host: everything before the last colon, which starts the
+        // port or instance (an IPv6 host has colons of its own), or the whole
+        // string if there is no colon
+        let host = if let Some(colon_pos) = rest.rfind(':') {
             &rest[..colon_pos]
         } else {
             rest
@@ -593,6 +595,16 @@ mod tests {
         assert_eq!(
             convert_spn_to_gssapi_format("MSSQLSvc/server"),
             "MSSQLSvc@server"
+        );
+
+        // An IPv6 host keeps its colons; only the port is dropped.
+        assert_eq!(
+            convert_spn_to_gssapi_format("MSSQLSvc/::1:1433"),
+            "MSSQLSvc@::1"
+        );
+        assert_eq!(
+            convert_spn_to_gssapi_format("MSSQLSvc/fe80::1:INST"),
+            "MSSQLSvc@fe80::1"
         );
     }
 }

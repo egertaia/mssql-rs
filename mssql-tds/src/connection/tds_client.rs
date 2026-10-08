@@ -917,6 +917,7 @@ impl TdsClient {
                         &reconnect_ctx,
                         &transport_context,
                         Some(Box::new((*snapshot).clone())),
+                        &crate::connection_provider::tds_connection_provider::NO_PROBE,
                     ),
                 ),
             )

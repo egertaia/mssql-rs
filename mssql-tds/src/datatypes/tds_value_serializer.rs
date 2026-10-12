@@ -159,9 +159,6 @@ impl TdsValueSerializer {
         ctx: &TdsTypeContext,
         narrow_string_byte_limit: Option<usize>,
     ) -> TdsResult<()> {
-        let ColumnValues::String(value) = value else {
-            return Ok(());
-        };
         if !matches!(ctx.tds_type, VARCHAR | CHAR | TEXT) {
             return Ok(());
         }
@@ -171,15 +168,38 @@ impl TdsValueSerializer {
             None if !ctx.is_plp => ctx.max_size,
             None => return Ok(()),
         };
+        Self::narrow_string_bytes(value, ctx, Some(maximum))?;
+        Ok(())
+    }
+
+    pub(crate) fn narrow_string_bytes<'a>(
+        value: &'a ColumnValues,
+        ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> TdsResult<Option<Cow<'a, [u8]>>> {
+        let ColumnValues::String(value) = value else {
+            return Ok(None);
+        };
+        if !matches!(ctx.tds_type, VARCHAR | CHAR | TEXT) {
+            return Ok(None);
+        }
+
+        let maximum = narrow_string_byte_limit.or_else(|| (!ctx.is_plp).then_some(ctx.max_size));
         if let Some(bytes) = value.as_raw_wire_bytes() {
-            Self::fit_narrow_bytes(bytes, maximum)?;
-            return Ok(());
+            let bytes = match maximum {
+                Some(maximum) => Self::fit_narrow_bytes(bytes, maximum)?,
+                None => bytes,
+            };
+            return Ok(Some(Cow::Borrowed(bytes)));
         }
 
         let text = value.to_utf8_string();
         let encoded = Self::encode_narrow_for_wire(&text, ctx.collation);
-        Self::fit_narrow_bytes(&encoded.bytes, maximum)?;
-        Ok(())
+        let bytes = match maximum {
+            Some(maximum) => Self::fit_narrow_bytes(&encoded.bytes, maximum)?,
+            None => &encoded.bytes,
+        };
+        Ok(Some(Cow::Owned(bytes.to_vec())))
     }
 
     /// Serialize a NULL value using the appropriate NULL marker for the type.
@@ -4177,7 +4197,7 @@ mod serializer_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{TdsTypeContext, TdsValueSerializer, VARCHAR};
+    use super::{PLP_TERMINATOR, PLP_UNKNOWN_LEN, TdsTypeContext, TdsValueSerializer, VARCHAR};
     use crate::datatypes::column_values::ColumnValues;
     use crate::datatypes::lcid_encoding::lcid_to_encoding;
     use crate::datatypes::sql_string::encode_narrow;
@@ -4187,6 +4207,10 @@ mod tests {
     use crate::message::messages::PacketType;
     use crate::token::tokens::SqlCollation;
     use futures::executor::block_on;
+
+    fn payload(writer: &PacketWriter) -> Vec<u8> {
+        writer.get_payload().into_inner()[8..].to_vec()
+    }
 
     /// Test that different collations use different encodings for non-ASCII characters
     #[test]
@@ -4572,7 +4596,7 @@ mod tests {
     #[test]
     fn explicit_limit_applies_to_plp_narrow_strings() {
         let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
-            utf16le("éé"),
+            utf16le("é "),
             crate::datatypes::sql_string::EncodingType::Utf16,
         ));
         let ctx = TdsTypeContext {
@@ -4585,8 +4609,81 @@ mod tests {
             collation: Some(utf8_collation()),
             is_nullable: true,
         };
+
+        let mut bounded_mock = MockNetworkWriter::new(64);
+        let mut bounded =
+            PacketWriter::new(PacketType::TabularResult, &mut bounded_mock, None, None);
+        block_on(
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                &mut bounded,
+                &value,
+                &ctx,
+                Some(2),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            payload(&bounded),
+            [
+                PLP_UNKNOWN_LEN.to_le_bytes().as_slice(),
+                2u32.to_le_bytes().as_slice(),
+                "é".as_bytes(),
+                PLP_TERMINATOR.to_le_bytes().as_slice(),
+            ]
+            .concat()
+        );
+
+        let mut unbounded_mock = MockNetworkWriter::new(64);
+        let mut unbounded =
+            PacketWriter::new(PacketType::TabularResult, &mut unbounded_mock, None, None);
+        block_on(TdsValueSerializer::serialize_value(
+            &mut unbounded,
+            &value,
+            &ctx,
+        ))
+        .unwrap();
+        assert_eq!(
+            payload(&unbounded),
+            [
+                PLP_UNKNOWN_LEN.to_le_bytes().as_slice(),
+                3u32.to_le_bytes().as_slice(),
+                "é ".as_bytes(),
+                PLP_TERMINATOR.to_le_bytes().as_slice(),
+            ]
+            .concat()
+        );
+
+        let spaces = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le("  "),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        let mut spaces_mock = MockNetworkWriter::new(64);
+        let mut spaces_writer =
+            PacketWriter::new(PacketType::TabularResult, &mut spaces_mock, None, None);
+        block_on(
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                &mut spaces_writer,
+                &spaces,
+                &ctx,
+                Some(0),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            payload(&spaces_writer),
+            [
+                PLP_UNKNOWN_LEN.to_le_bytes().as_slice(),
+                PLP_TERMINATOR.to_le_bytes().as_slice(),
+            ]
+            .concat()
+        );
+
+        let too_long = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le("éé"),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
         assert!(matches!(
-            TdsValueSerializer::validate_narrow_string_length(&value, &ctx, Some(3)),
+            TdsValueSerializer::validate_narrow_string_length(&too_long, &ctx, Some(3)),
             Err(Error::EncodedValueTooLong {
                 actual: 4,
                 maximum: 3

@@ -1714,23 +1714,19 @@ TEST_F(CharConversionLiveTest, ConversionFailureAfterAFlushLeavesTheConnectionUs
     ExpectSameSessionStillUsable(spid);
 }
 
-// Strands this driver: the value passes our UTF-16 unit count at one unit, then
-// `serialize_string` rejects it against varchar(1) once the collation's code
-// page turns it into two bytes - after parameter 1 has flushed. msodbcsql
-// measures the converted bytes first and rejects it before sending anything, so
-// it never reaches the partial-send state here and the case is skipped on that
-// leg.
+// The value is one UTF-16 unit but two destination bytes. Both drivers reject
+// it before sending the RPC; this driver's RPC preflight must also leave the
+// connection usable even though an earlier parameter is large enough to flush
+// if serialization starts.
 //
 // Needs a DBCS collation. This used to run on Latin1, where U+65E5 was
 // unmappable and `encoding_rs` expanded it to the eight bytes of "&#26085;";
 // that expansion was itself the bug, and an unmappable character is now one '?'
 // byte (AB#47598), so nothing a Latin1 code page produces can outgrow the unit
 // count that let it through. A multi-byte *mappable* character is what is left.
-// The retraction mechanism itself is covered without a server by mssql-tds'
-// `a_send_site_retracts_when_serialization_fails_after_a_flush`, which binds
-// past the declared length directly and so does not need this gap.
-TEST_F(CharConversionLiveTest, SerializationFailureAfterAFlushLeavesTheConnectionUsable) {
-    SKIP_IF_COMPARING_MSODBCSQL();
+// Actual partial-send recovery is covered without a server by mssql-tds'
+// `cancel_streamed_write_after_partial_send_ignores_and_drains`.
+TEST_F(CharConversionLiveTest, PreflightEncodingFailureLeavesTheConnectionUsable) {
     const std::string collation = DatabaseCollation();
     // Japanese / Chinese / Korean collations select a DBCS code page, where a
     // single BMP character is two bytes.

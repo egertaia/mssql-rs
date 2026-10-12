@@ -455,8 +455,13 @@ unsafe fn sql_put_data_safe(
             };
             dae.progress.buffer.extend_from_slice(chunk);
             let trimmed_spaces = measured.len().saturating_sub(kept.len());
-            if trim_buffered_encoded_spaces(&mut dae.progress.buffer, c_type, trimmed_spaces)
-                .is_err()
+            if trim_buffered_encoded_spaces(
+                &mut dae.progress.buffer,
+                c_type,
+                trimmed_spaces,
+                dae.progress.carry.len(),
+            )
+            .is_err()
             {
                 drop(stmt_state);
                 return abort_dae_with_diag(
@@ -703,6 +708,7 @@ fn trim_buffered_encoded_spaces(
     buffer: &mut Vec<u8>,
     c_type: i16,
     encoded_spaces: usize,
+    carry_len: usize,
 ) -> Result<(), ()> {
     if encoded_spaces == 0 {
         return Ok(());
@@ -712,10 +718,11 @@ fn trim_buffered_encoded_spaces(
         SQL_C_WCHAR => encoded_spaces.saturating_mul(size_of::<u16>()),
         _ => return Err(()),
     };
-    let keep = buffer.len().checked_sub(source_bytes).ok_or(())?;
+    let completed_end = buffer.len().checked_sub(carry_len).ok_or(())?;
+    let keep = completed_end.checked_sub(source_bytes).ok_or(())?;
     let is_padding = match c_type {
-        SQL_C_CHAR => buffer[keep..].iter().all(|byte| *byte == b' '),
-        SQL_C_WCHAR => buffer[keep..]
+        SQL_C_CHAR => buffer[keep..completed_end].iter().all(|byte| *byte == b' '),
+        SQL_C_WCHAR => buffer[keep..completed_end]
             .chunks_exact(size_of::<u16>())
             .all(|unit| unit == [b' ', 0]),
         _ => false,
@@ -723,7 +730,7 @@ fn trim_buffered_encoded_spaces(
     if !is_padding {
         return Err(());
     }
-    buffer.truncate(keep);
+    buffer.drain(keep..completed_end);
     Ok(())
 }
 
@@ -1126,6 +1133,52 @@ mod tests {
         assert_eq!(dae.progress.bytes_sent, 2);
         assert_eq!(dae.progress.retained_units, 1);
         assert_eq!(dae.progress.buffer, "é".as_bytes());
+    }
+
+    #[test]
+    fn buffered_narrow_trimming_preserves_partial_utf16_carry() {
+        let limit = crate::conversion::param_convert::dae_length_limit(
+            crate::api::odbc_types::SQL_C_WCHAR,
+            SQL_VARCHAR,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 0,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        {
+            let mut state = stmt.inner.lock().unwrap();
+            let mut param = DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(crate::api::odbc_types::SQL_C_WCHAR, SQL_VARCHAR)
+                .with_length_limit(limit);
+            param.transcode = Some(crate::conversion::param_convert::DaeTranscode::new(
+                crate::api::odbc_types::SQL_C_WCHAR,
+                SQL_VARCHAR,
+                collation,
+            ));
+            let mut dae = DaeState::for_test(vec![param], Some(0));
+            dae.deferred = true;
+            state.dae = Some(dae);
+        }
+
+        let mut value = [b'a', 0, b' ', 0, b'x'];
+        assert_eq!(
+            unsafe { sql_put_data(h.stmt, value.as_mut_ptr().cast(), value.len() as SqlLen) },
+            SQL_SUCCESS
+        );
+
+        let state = stmt.inner.lock().unwrap();
+        let dae = state.dae.as_ref().unwrap();
+        assert_eq!(dae.progress.retained_units, 1);
+        assert_eq!(dae.progress.buffer, [b'a', 0, b'x']);
+        assert_eq!(dae.progress.carry, [b'x']);
     }
 
     #[test]

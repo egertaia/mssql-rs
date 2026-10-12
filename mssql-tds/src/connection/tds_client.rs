@@ -4705,6 +4705,7 @@ impl TdsClient {
             if let Some(params) = named_parameters.as_mut() {
                 param_refs.extend(params.iter_mut());
             }
+            let database_collation = self.negotiated_settings.database_collation;
             Self::apply_parameter_encryption(
                 &describe,
                 &providers,
@@ -4712,6 +4713,7 @@ impl TdsClient {
                 &mut param_refs,
                 &mut self.output_param_ceks,
                 &trusted_key_paths,
+                &database_collation,
             )
             .await?;
         }
@@ -6281,6 +6283,7 @@ impl TdsClient {
             .await?;
 
         let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
+        let database_collation = self.negotiated_settings.database_collation;
         Self::apply_parameter_encryption(
             &describe,
             &providers,
@@ -6288,6 +6291,7 @@ impl TdsClient {
             params,
             &mut self.output_param_ceks,
             &trusted_key_paths,
+            &database_collation,
         )
         .await?;
         Ok(describe)
@@ -6408,6 +6412,7 @@ impl TdsClient {
         params: &mut [&mut RpcParameter],
         output_param_ceks: &mut HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
         trusted_key_paths: &[String],
+        database_collation: &SqlCollation,
     ) -> TdsResult<()> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
@@ -6511,8 +6516,9 @@ impl TdsClient {
 
             let param = &mut *params[index];
 
+            let value = param.value_for_encryption(database_collation)?;
             let ciphertext = encrypt_parameter(
-                param.value()?,
+                &value,
                 plaintext_cek.as_slice(),
                 info.cipher_algorithm_id,
                 info.encryption_type,
@@ -16720,6 +16726,12 @@ mod tests {
             &mut params,
             &mut output_param_ceks,
             &[],
+            &SqlCollation {
+                info: 0x0409,
+                lcid_language_id: 0,
+                col_flags: 0,
+                sort_id: 0,
+            },
         )
         .await
         .expect_err("a forced parameter omitted from the describe result must be rejected");

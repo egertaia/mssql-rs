@@ -1,14 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::borrow::Cow;
+
 use bitflags::bitflags;
 
 use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
 use crate::datatypes::encoder::SqlValueEncoder;
+use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sql_tvp::TvpTypeName;
 use crate::datatypes::sql_udt::UdtTypeName;
 use crate::datatypes::sqldatatypes::VectorBaseType;
 use crate::datatypes::sqltypes::SqlType;
+use crate::datatypes::tds_value_serializer::TdsValueSerializer;
 use crate::{
     core::TdsResult,
     datatypes::sqldatatypes::TdsDataType,
@@ -724,6 +728,33 @@ impl RpcParameter {
         }
     }
 
+    pub(crate) fn value_for_encryption(
+        &self,
+        db_collation: &SqlCollation,
+    ) -> TdsResult<Cow<'_, SqlType>> {
+        let value = self.value()?;
+        let (column_value, context) = value.to_column_value_and_context(db_collation);
+        let Some(bytes) = TdsValueSerializer::narrow_string_bytes(
+            &column_value,
+            &context,
+            self.narrow_string_byte_limit,
+        )?
+        else {
+            return Ok(Cow::Borrowed(value));
+        };
+
+        let mut fitted = value.clone();
+        let sql_string = SqlString::new(bytes.into_owned(), EncodingType::LcidBased(*db_collation));
+        match &mut fitted {
+            SqlType::Varchar(string, _)
+            | SqlType::VarcharMax(string)
+            | SqlType::Char(string, _)
+            | SqlType::Text(string) => *string = Some(sql_string),
+            _ => return Ok(Cow::Borrowed(value)),
+        }
+        Ok(Cow::Owned(fitted))
+    }
+
     /// Returns `true` when the parameter is passed by reference (an output or
     /// input/output parameter). Used when building the
     /// `sp_describe_parameter_encryption` request for a stored procedure, where
@@ -968,6 +999,37 @@ mod tests {
     use crate::message::messages::PacketType;
     use crate::token::tokens::SqlCollation;
     use futures::executor::block_on;
+
+    #[test]
+    fn encrypted_narrow_value_uses_the_fitted_wire_plaintext() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                    "é ".to_string(),
+                )),
+                2,
+            ),
+        );
+
+        let fitted = parameter.value_for_encryption(&collation).unwrap();
+        let SqlType::Varchar(Some(value), 2) = fitted.as_ref() else {
+            panic!("expected a fitted varchar(2)");
+        };
+        assert_eq!(value.bytes, "é".as_bytes());
+
+        let SqlType::Varchar(Some(original), 2) = parameter.value().unwrap() else {
+            panic!("expected the original varchar(2)");
+        };
+        assert_eq!(original.to_utf8_string(), "é ");
+    }
 
     /// A UDT is declared by its own server-side name, not the TDS type name
     /// `udt`, which `sp_executesql` cannot resolve ("Cannot find data type

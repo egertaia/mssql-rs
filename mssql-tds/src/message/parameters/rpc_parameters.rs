@@ -731,16 +731,16 @@ impl RpcParameter {
     pub(crate) fn value_for_encryption(
         &self,
         db_collation: &SqlCollation,
-    ) -> TdsResult<Cow<'_, SqlType>> {
+    ) -> TdsResult<(Cow<'_, SqlType>, bool)> {
         let value = self.value()?;
         let (column_value, context) = value.to_column_value_and_context(db_collation);
-        let Some(bytes) = TdsValueSerializer::narrow_string_bytes(
+        let Some((bytes, had_loss)) = TdsValueSerializer::narrow_string_bytes(
             &column_value,
             &context,
             self.narrow_string_byte_limit,
         )?
         else {
-            return Ok(Cow::Borrowed(value));
+            return Ok((Cow::Borrowed(value), false));
         };
 
         let mut fitted = value.clone();
@@ -750,9 +750,9 @@ impl RpcParameter {
             | SqlType::VarcharMax(string)
             | SqlType::Char(string, _)
             | SqlType::Text(string) => *string = Some(sql_string),
-            _ => return Ok(Cow::Borrowed(value)),
+            _ => return Ok((Cow::Borrowed(value), false)),
         }
-        Ok(Cow::Owned(fitted))
+        Ok((Cow::Owned(fitted), had_loss))
     }
 
     /// Returns `true` when the parameter is passed by reference (an output or
@@ -1019,7 +1019,8 @@ mod tests {
             ),
         );
 
-        let fitted = parameter.value_for_encryption(&collation).unwrap();
+        let (fitted, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+        assert!(!had_loss);
         let SqlType::Varchar(Some(value), 2) = fitted.as_ref() else {
             panic!("expected a fitted varchar(2)");
         };
@@ -1029,6 +1030,33 @@ mod tests {
             panic!("expected the original varchar(2)");
         };
         assert_eq!(original.to_utf8_string(), "é ");
+    }
+
+    #[test]
+    fn encrypted_narrow_value_preserves_conversion_loss() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                    "日".to_string(),
+                )),
+                1,
+            ),
+        );
+
+        let (fitted, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+        let SqlType::Varchar(Some(value), 1) = fitted.as_ref() else {
+            panic!("expected a fitted varchar(1)");
+        };
+        assert_eq!(value.bytes, b"?");
+        assert!(had_loss);
     }
 
     /// A UDT is declared by its own server-side name, not the TDS type name

@@ -176,7 +176,7 @@ impl TdsValueSerializer {
         value: &'a ColumnValues,
         ctx: &TdsTypeContext,
         narrow_string_byte_limit: Option<usize>,
-    ) -> TdsResult<Option<Cow<'a, [u8]>>> {
+    ) -> TdsResult<Option<(Cow<'a, [u8]>, bool)>> {
         let ColumnValues::String(value) = value else {
             return Ok(None);
         };
@@ -190,16 +190,16 @@ impl TdsValueSerializer {
                 Some(maximum) => Self::fit_narrow_bytes(bytes, maximum)?,
                 None => bytes,
             };
-            return Ok(Some(Cow::Borrowed(bytes)));
+            return Ok(Some((Cow::Borrowed(bytes), false)));
         }
 
         let text = value.to_utf8_string();
-        let encoded = Self::encode_narrow_for_wire(&text, ctx.collation);
-        let bytes = match maximum {
-            Some(maximum) => Self::fit_narrow_bytes(&encoded.bytes, maximum)?,
-            None => &encoded.bytes,
-        };
-        Ok(Some(Cow::Owned(bytes.to_vec())))
+        let mut encoded = Self::encode_narrow_for_wire(&text, ctx.collation);
+        if let Some(maximum) = maximum {
+            let fitted_len = Self::fit_narrow_bytes(&encoded.bytes, maximum)?.len();
+            encoded.bytes.truncate(fitted_len);
+        }
+        Ok(Some((Cow::Owned(encoded.bytes), encoded.had_loss)))
     }
 
     /// Serialize a NULL value using the appropriate NULL marker for the type.

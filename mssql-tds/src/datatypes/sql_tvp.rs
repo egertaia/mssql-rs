@@ -612,7 +612,7 @@ mod tests {
         let mut mock = MockNetworkWriter::new(4096);
         let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
         value
-            .serialize(&mut writer, &collation, None)
+            .serialize_with_narrow_string_byte_limit(&mut writer, &collation, None, None)
             .await
             .unwrap();
         writer.finalize().await.unwrap();

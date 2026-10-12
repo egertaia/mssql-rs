@@ -700,22 +700,6 @@ impl SqlType {
     /// carry them (a typed NULL decimal or temporal). The caller derives the SQL
     /// declaration from the same metadata, so the declared type and the wire
     /// `TYPE_INFO` always agree.
-    #[allow(dead_code)]
-    pub(crate) async fn serialize(
-        &self,
-        packet_writer: &mut PacketWriter<'_>,
-        db_collation: &SqlCollation,
-        type_metadata: Option<RpcTypeMetadata>,
-    ) -> TdsResult<()> {
-        self.serialize_with_narrow_string_byte_limit(
-            packet_writer,
-            db_collation,
-            type_metadata,
-            None,
-        )
-        .await
-    }
-
     pub(crate) async fn serialize_with_narrow_string_byte_limit(
         &self,
         packet_writer: &mut PacketWriter<'_>,
@@ -1122,6 +1106,14 @@ impl SqlType {
                 Self::validate_variant_inner(inner)?;
                 inner.validate_for_send(db_collation, None)
             }
+            SqlType::Varchar(_, length)
+                if narrow_string_byte_limit.is_none() && *length > VAR_TDS_MAX_LENGTH =>
+            {
+                Ok(())
+            }
+            SqlType::VarcharMax(_) | SqlType::Text(_) if narrow_string_byte_limit.is_none() => {
+                Ok(())
+            }
             SqlType::Vector(vector, dimensions, base_type) => {
                 Self::validate_vector(vector.as_ref(), *dimensions, *base_type)
             }
@@ -1469,7 +1461,12 @@ mod variant_tests {
             None,
         );
         sql_type
-            .serialize(&mut packet_writer, &default_collation(), None)
+            .serialize_with_narrow_string_byte_limit(
+                &mut packet_writer,
+                &default_collation(),
+                None,
+                None,
+            )
             .await
             .unwrap();
         packet_writer.finalize().await.unwrap();
@@ -1706,6 +1703,39 @@ mod variant_tests {
         assert!(cursor.chunk().is_empty());
     }
 
+    #[tokio::test]
+    async fn variant_varchar_trims_trailing_space_overflow_on_the_wire() {
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let value = SqlType::Variant(Box::new(SqlType::Varchar(
+            Some(SqlString::new("é ".as_bytes().to_vec(), EncodingType::Utf8)),
+            2,
+        )));
+        let mut mock = MockNetworkWriter::new(128);
+        let mut writer = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        value
+            .serialize_with_narrow_string_byte_limit(&mut writer, &collation, None, None)
+            .await
+            .unwrap();
+        writer.finalize().await.unwrap();
+
+        let payload = mock.data[PacketWriter::PACKET_HEADER_SIZE..].to_vec();
+        let mut cursor = Cursor::new(payload);
+        assert_eq!(cursor.get_u8(), TdsDataType::SsVariant as u8);
+        assert_eq!(cursor.get_u32_le(), SQL_VARIANT_MAX_LENGTH);
+        assert_eq!(cursor.get_u32_le(), 11);
+        assert_eq!(cursor.get_u8(), TdsDataType::BigVarChar as u8);
+        assert_eq!(cursor.get_u8(), 7);
+        assert_eq!(cursor.get_u32_le(), 0);
+        assert_eq!(cursor.get_u8(), 0);
+        assert_eq!(cursor.get_u16_le(), 2);
+        assert_eq!(cursor.chunk(), "é".as_bytes());
+    }
+
     /// The serializer's wire-level 8000-byte cap remains the backstop for a
     /// caller that reaches variant serialization without RPC preflight.
     ///
@@ -1729,7 +1759,12 @@ mod variant_tests {
             None,
         );
         SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 8000)))
-            .serialize(&mut packet_writer, &default_collation(), None)
+            .serialize_with_narrow_string_byte_limit(
+                &mut packet_writer,
+                &default_collation(),
+                None,
+                None,
+            )
             .await
             .expect("2000 substituted bytes fit the cap");
         assert!(
@@ -1760,7 +1795,12 @@ mod variant_tests {
             None,
         );
         SqlType::Variant(Box::new(SqlType::Varchar(Some(val), 8000)))
-            .serialize(&mut packet_writer, &default_collation(), None)
+            .serialize_with_narrow_string_byte_limit(
+                &mut packet_writer,
+                &default_collation(),
+                None,
+                None,
+            )
             .await
             .expect_err("8001 substituted bytes exceed the variant cap");
         assert!(
@@ -1872,7 +1912,12 @@ mod variant_tests {
                 None,
             );
             let result = SqlType::Variant(Box::new(inner))
-                .serialize(&mut packet_writer, &default_collation(), None)
+                .serialize_with_narrow_string_byte_limit(
+                    &mut packet_writer,
+                    &default_collation(),
+                    None,
+                    None,
+                )
                 .await;
             assert!(
                 matches!(result, Err(Error::UsageError(_))),

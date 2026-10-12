@@ -4706,7 +4706,7 @@ impl TdsClient {
                 param_refs.extend(params.iter_mut());
             }
             let database_collation = self.negotiated_settings.database_collation;
-            Self::apply_parameter_encryption(
+            let had_conversion_loss = Self::apply_parameter_encryption(
                 &describe,
                 &providers,
                 &cek_cache,
@@ -4716,6 +4716,9 @@ impl TdsClient {
                 &database_collation,
             )
             .await?;
+            if had_conversion_loss {
+                self.note_code_page_conversion_loss();
+            }
         }
 
         let database_collation = self.negotiated_settings.database_collation;
@@ -6284,7 +6287,7 @@ impl TdsClient {
 
         let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
         let database_collation = self.negotiated_settings.database_collation;
-        Self::apply_parameter_encryption(
+        let had_conversion_loss = Self::apply_parameter_encryption(
             &describe,
             &providers,
             &cek_cache,
@@ -6294,6 +6297,9 @@ impl TdsClient {
             &database_collation,
         )
         .await?;
+        if had_conversion_loss {
+            self.note_code_page_conversion_loss();
+        }
         Ok(describe)
     }
 
@@ -6413,7 +6419,7 @@ impl TdsClient {
         output_param_ceks: &mut HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
         trusted_key_paths: &[String],
         database_collation: &SqlCollation,
-    ) -> TdsResult<()> {
+    ) -> TdsResult<bool> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
         use crate::security::keystore::decrypt_cek;
@@ -6462,9 +6468,10 @@ impl TdsClient {
 
         // Nothing to do when the server reports no encrypted parameters.
         if !describe.parameters.iter().any(|p| p.is_encrypted()) {
-            return Ok(());
+            return Ok(false);
         }
 
+        let mut had_conversion_loss = false;
         for info in &describe.parameters {
             if !info.is_encrypted() {
                 continue;
@@ -6516,7 +6523,8 @@ impl TdsClient {
 
             let param = &mut *params[index];
 
-            let value = param.value_for_encryption(database_collation)?;
+            let (value, value_had_conversion_loss) =
+                param.value_for_encryption(database_collation)?;
             let ciphertext = encrypt_parameter(
                 &value,
                 plaintext_cek.as_slice(),
@@ -6524,6 +6532,7 @@ impl TdsClient {
                 info.encryption_type,
                 info.normalization_rule_version,
             )?;
+            had_conversion_loss |= value_had_conversion_loss;
 
             param.set_encrypted(
                 ciphertext,
@@ -6538,7 +6547,7 @@ impl TdsClient {
                 },
             );
         }
-        Ok(())
+        Ok(had_conversion_loss)
     }
 
     /// Builds the `@tsql` and `@params` arguments for
@@ -8537,9 +8546,10 @@ impl TdsClient {
     /// spans several messages and reports the aggregate across every batch, so
     /// one read after `write_to_server_zerocopy` covers the whole operation.
     ///
-    /// Silent for an Always Encrypted column in either direction: cell
-    /// encryption consumes the value before the narrow serializer runs, so no
-    /// substitution happens and none is reported. See
+    /// Always Encrypted parameters report substitution performed while fitting
+    /// plaintext to the destination collation before encryption. Encrypted
+    /// result values and bulk-copy cells remain silent because their encryption
+    /// paths do not perform narrow conversion. See
     /// [`StreamingBulkLoadWriter::code_page_conversion_loss`](crate::message::bulk_load::StreamingBulkLoadWriter::code_page_conversion_loss).
     pub fn take_code_page_conversion_loss(&mut self) -> bool {
         std::mem::take(&mut self.code_page_conversion_loss)

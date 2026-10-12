@@ -196,14 +196,16 @@ fn set_dae_transcodes(
     include_streamed: bool,
 ) {
     for param in dae_params {
-        if (include_streamed && !param.plan.is_buffered())
-            || param
-                .length_limit
-                .is_some_and(|limit| limit.requires_encoded_input())
-        {
-            let transcode =
+        let validates_encoded_input = param
+            .length_limit
+            .is_some_and(|limit| limit.requires_encoded_input());
+        if (include_streamed && !param.plan.is_buffered()) || validates_encoded_input {
+            let mut transcode =
                 DaeTranscode::new(param.binding.c_type, param.binding.sql_type, collation);
-            if !transcode.is_passthrough() {
+            if validates_encoded_input {
+                transcode = transcode.with_passthrough_validation();
+            }
+            if validates_encoded_input || !transcode.is_passthrough() {
                 param.transcode = Some(transcode);
             }
         }
@@ -1400,7 +1402,7 @@ mod tests {
     use super::*;
     use crate::api::odbc_types::{
         SQL_C_CHAR, SQL_C_LONG, SQL_C_WCHAR, SQL_DEFAULT_PARAM, SQL_INTEGER, SQL_NTS,
-        SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, SqlULen, sql_len_data_at_exec,
+        SQL_PARAM_INPUT, SQL_VARCHAR, SqlLen, sql_len_data_at_exec,
     };
     use crate::handles::handle_from_raw;
     use crate::params::BoundParam;
@@ -1453,6 +1455,35 @@ mod tests {
             let mut carry = Vec::new();
             assert_eq!(transcode.push(&mut carry, input).bytes, [0xE9]);
         }
+    }
+
+    #[test]
+    fn encoded_length_validation_repairs_malformed_utf8_before_measuring() {
+        let collation = mssql_tds::token::tokens::SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let limit = dae_length_limit(SQL_C_CHAR, SQL_VARCHAR, 1)
+            .unwrap()
+            .unwrap();
+        let mut params = vec![
+            DaeParam::unbounded(0, std::ptr::null_mut(), None)
+                .with_binding_types(SQL_C_CHAR, SQL_VARCHAR)
+                .with_length_limit(limit),
+        ];
+
+        set_dae_transcodes(&mut params, collation, false);
+
+        let transcode = params[0]
+            .transcode
+            .expect("encoded-byte validation needs a validating transcoder");
+        let mut carry = Vec::new();
+        assert_eq!(
+            transcode.push(&mut carry, &[0xFF]).bytes,
+            "\u{FFFD}".as_bytes()
+        );
     }
 
     #[test]

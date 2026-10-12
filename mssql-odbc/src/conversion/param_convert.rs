@@ -885,6 +885,7 @@ pub(crate) enum DaeTarget {
 pub(crate) struct DaeTranscode {
     source: DaeSource,
     target: DaeTarget,
+    validate_passthrough: bool,
 }
 
 impl DaeTranscode {
@@ -902,7 +903,16 @@ impl DaeTranscode {
             Some(SqlFamily::Character) => DaeTarget::Narrow(collation),
             _ => DaeTarget::Raw,
         };
-        Self { source, target }
+        Self {
+            source,
+            target,
+            validate_passthrough: false,
+        }
+    }
+
+    pub(crate) fn with_passthrough_validation(mut self) -> Self {
+        self.validate_passthrough = true;
+        self
     }
 
     /// `true` when the buffer's bytes are already the wire's bytes, so a chunk
@@ -926,7 +936,7 @@ impl DaeTranscode {
     /// chunk goes straight to the wire, so there is no later message-level flag
     /// to carry it the way the materialized path has (AB#47598).
     pub(crate) fn push(&self, carry: &mut Vec<u8>, chunk: &[u8]) -> DaeChunk {
-        if self.is_passthrough() {
+        if self.is_passthrough() && !self.validate_passthrough {
             return DaeChunk::exact(chunk.to_vec());
         }
         let mut buf = std::mem::take(carry);
@@ -1016,18 +1026,29 @@ fn incomplete_utf8_tail(buf: &[u8]) -> usize {
             // ASCII: a complete sequence on its own.
             return 0;
         }
-        if byte >= 0xC0 {
-            // A lead byte: complete only once all of its continuations landed.
-            let needed = if byte >= 0xF0 {
-                4
-            } else if byte >= 0xE0 {
-                3
-            } else {
-                2
-            };
-            return if back < needed { back } else { 0 };
+        let needed = match byte {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            0x80..=0xBF => continue,
+            _ => return 0,
+        };
+        let suffix = &buf[buf.len() - back..];
+        if !suffix[1..]
+            .iter()
+            .all(|continuation| matches!(continuation, 0x80..=0xBF))
+        {
+            return 0;
         }
-        // A continuation byte; keep walking back for the lead.
+        if let Some(first_continuation) = suffix.get(1)
+            && ((byte == 0xE0 && *first_continuation < 0xA0)
+                || (byte == 0xED && *first_continuation > 0x9F)
+                || (byte == 0xF0 && *first_continuation < 0x90)
+                || (byte == 0xF4 && *first_continuation > 0x8F))
+        {
+            return 0;
+        }
+        return if back < needed { back } else { 0 };
     }
     0
 }

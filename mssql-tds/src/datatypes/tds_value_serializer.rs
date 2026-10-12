@@ -2079,7 +2079,14 @@ impl TdsValueSerializer {
             {
                 let (bytes, had_loss) = Self::resolve_narrow_wire_bytes(s, ctx.collation);
                 narrow_had_loss = had_loss;
-                Some(bytes)
+                let fitted_len = Self::fit_narrow_bytes(&bytes, ctx.max_size)?.len();
+                Some(match bytes {
+                    Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[..fitted_len]),
+                    Cow::Owned(mut bytes) => {
+                        bytes.truncate(fitted_len);
+                        Cow::Owned(bytes)
+                    }
+                })
             }
             _ => None,
         };
@@ -4101,6 +4108,37 @@ mod serializer_tests {
         assert_eq!(p[5], 0x07); // prop_len = 7
         assert_eq!(u16::from_le_bytes([p[11], p[12]]), 5); // max_length = 5 UTF-8 bytes
         assert_eq!(&p[13..18], "café".as_bytes());
+    }
+
+    #[test]
+    fn variant_varchar_serialization_applies_trailing_space_fitting() {
+        let mut mock = MockNetworkWriter::new(128);
+        let mut writer = PacketWriter::new(PacketType::TabularResult, &mut mock, None, None);
+        let mut ctx = nullable_ctx(0x62);
+        ctx.max_size = 1;
+        ctx.collation = Some(crate::token::tokens::SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        });
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            b"a ".to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+
+        block_on(TdsValueSerializer::serialize_value(
+            &mut writer,
+            &value,
+            &ctx,
+        ))
+        .unwrap();
+
+        let bytes = payload(&writer);
+        assert_eq!(&bytes[0..4], &10u32.to_le_bytes());
+        assert_eq!(bytes[4], 0xA7);
+        assert_eq!(u16::from_le_bytes([bytes[11], bytes[12]]), 1);
+        assert_eq!(&bytes[13..], b"a");
     }
 
     /// The collation defaulted when none is known must be the same one used

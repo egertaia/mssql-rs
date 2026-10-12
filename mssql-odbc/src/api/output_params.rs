@@ -15,12 +15,14 @@ use mssql_tds::datatypes::column_values::ColumnValues;
 use mssql_tds::query::result::ReturnValue;
 use mssql_tds::token::tokenitems::ReturnValueStatus;
 
+use crate::api::exec_common::ParamArrayHeader;
 use crate::api::fetch_scroll::{RowOutcome, deliver_bound_value};
 use crate::api::odbc_types::{
-    SQL_ATTR_PARAM_BIND_TYPE, SQL_BIND_BY_COLUMN, SQL_ERROR, SQL_PARAM_INPUT_OUTPUT,
-    SQL_PARAM_OUTPUT, SQL_RETURN_VALUE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlReturn,
+    SQL_ERROR, SQL_PARAM_INPUT_OUTPUT, SQL_PARAM_OUTPUT, SQL_RETURN_VALUE, SQL_SUCCESS,
+    SQL_SUCCESS_WITH_INFO, SqlReturn,
 };
 use crate::api::sqlstate::{ERR_INVALID_STRING_OR_BUFFER_LENGTH, post_diag};
+use crate::conversion::fetch_convert::TextOutput;
 use crate::handles::stmt::{ColumnBinding, StmtState};
 use crate::params::{BoundParam, ParamSnapshot};
 
@@ -35,12 +37,13 @@ use crate::params::{BoundParam, ParamSnapshot};
 ///
 /// # Safety
 /// Every bound output parameter's value and indicator buffers must still be
-/// writable at the current parameter binding offset. `bound_params` must be a
-/// fresh effective APD/IPD snapshot, taken before acquiring the STMT lock, not
-/// the execution-time input snapshot.
+/// writable at the current parameter binding offset. `bound_params` and
+/// `header` must be a fresh effective APD/IPD snapshot, taken before acquiring
+/// the STMT lock, not the execution-time input snapshot.
 pub(crate) unsafe fn write_back_output_params(
     stmt_state: &mut StmtState,
     bound_params: &[Option<ParamSnapshot>],
+    header: &ParamArrayHeader,
     return_values: &[ReturnValue],
     return_status: Option<i32>,
 ) -> SqlReturn {
@@ -55,12 +58,9 @@ pub(crate) unsafe fn write_back_output_params(
                 SQL_PARAM_OUTPUT | SQL_PARAM_INPUT_OUTPUT | SQL_RETURN_VALUE
             )
         });
-    // The application can change the pointed-to offset after execution.
-    let bind_offset = unsafe { stmt_state.inert_attrs.param_bind_offset() };
-    let bind_type = stmt_state
-        .inert_attrs
-        .get(SQL_ATTR_PARAM_BIND_TYPE)
-        .unwrap_or(SQL_BIND_BY_COLUMN);
+    // The application can change the offset after execution.
+    let bind_offset = unsafe { header.bind_offset() };
+    let bind_type = header.bind_type;
 
     // Output parameters only; a UDF return value is not one of them.
     let outputs: Vec<&ReturnValue> = return_values
@@ -104,7 +104,7 @@ pub(crate) unsafe fn write_back_output_params(
             };
             &value.value
         };
-        match unsafe { write_value(&param, value) } {
+        match unsafe { write_value(&param, value, stmt_state.text_output) } {
             RowOutcome::Success => {}
             RowOutcome::Info(issue) => {
                 issue.post(stmt_state);
@@ -131,7 +131,7 @@ pub(crate) unsafe fn write_back_output_params(
 /// # Safety
 /// The parameter's value, indicator, and octet-length buffers must be writable
 /// for one element according to its bound C type and buffer length.
-unsafe fn write_value(param: &BoundParam, value: &ColumnValues) -> RowOutcome {
+unsafe fn write_value(param: &BoundParam, value: &ColumnValues, output: TextOutput) -> RowOutcome {
     let binding = ColumnBinding {
         column_number: 1,
         target_type: param.c_type,
@@ -144,7 +144,7 @@ unsafe fn write_value(param: &BoundParam, value: &ColumnValues) -> RowOutcome {
         strlen_or_ind_ptr: param.strlen_or_ind_ptr,
         octet_length_ptr: param.octet_length_ptr,
     };
-    unsafe { deliver_bound_value(&binding, value) }
+    unsafe { deliver_bound_value(&binding, value, output) }
 }
 
 #[cfg(test)]
@@ -201,6 +201,37 @@ mod tests {
     }
 
     #[test]
+    fn output_parameter_uses_client_code_page_and_reports_client_byte_length() {
+        use crate::conversion::client_encoding::ClientEncoding;
+        use mssql_tds::datatypes::sql_string::{EncodingType, SqlString};
+
+        let mut buffer = [0xcc_u8; 8];
+        let mut length = -99;
+        let binding = output_param(
+            SQL_C_CHAR,
+            SQL_VARCHAR,
+            buffer.as_mut_ptr().cast(),
+            8,
+            &mut length,
+        );
+        let value = ColumnValues::String(SqlString::new(
+            "caf\u{e9}".as_bytes().to_vec(),
+            EncodingType::Utf8,
+        ));
+        let output = TextOutput {
+            encoding: ClientEncoding::for_code_page(1252).unwrap(),
+            warn_on_loss: true,
+        };
+        assert!(matches!(
+            unsafe { write_value(&binding, &value, output) },
+            RowOutcome::Success
+        ));
+        assert_eq!(length, 4);
+        assert_eq!(&buffer[..5], b"caf\xe9\0");
+        assert_eq!(buffer[5], 0xcc);
+    }
+
+    #[test]
     fn indicator_only_output_never_writes_a_null_destination() {
         let mut length = -2;
         let integer = output_param(
@@ -211,12 +242,12 @@ mod tests {
             &raw mut length,
         );
         assert!(matches!(
-            unsafe { write_value(&integer, &ColumnValues::Int(73)) },
+            unsafe { write_value(&integer, &ColumnValues::Int(73), TextOutput::UTF8) },
             RowOutcome::Success
         ));
         assert_eq!(length, 4);
         assert!(matches!(
-            unsafe { write_value(&integer, &ColumnValues::Null) },
+            unsafe { write_value(&integer, &ColumnValues::Null, TextOutput::UTF8) },
             RowOutcome::Success
         ));
         assert_eq!(length, crate::api::odbc_types::SQL_NULL_DATA);
@@ -228,12 +259,12 @@ mod tests {
             &raw mut length,
         );
         assert!(matches!(
-            unsafe { write_value(&text, &ColumnValues::Int(73)) },
+            unsafe { write_value(&text, &ColumnValues::Int(73), TextOutput::UTF8) },
             RowOutcome::Info(crate::api::fetch_scroll::RowIssue::StringTruncated)
         ));
         assert_eq!(length, 2);
         assert!(matches!(
-            unsafe { write_value(&text, &ColumnValues::Null) },
+            unsafe { write_value(&text, &ColumnValues::Null, TextOutput::UTF8) },
             RowOutcome::Success
         ));
         assert_eq!(length, crate::api::odbc_types::SQL_NULL_DATA);
@@ -276,7 +307,7 @@ mod tests {
                 std::ptr::null_mut(),
             );
             bind(&h, old_param);
-            let stale = snapshot_bound_params(stmt).unwrap();
+            let stale = snapshot_bound_params(stmt).unwrap().params;
             {
                 let mut state = stmt.inner.lock().unwrap();
                 state.bound_params = stale;
@@ -379,7 +410,15 @@ mod tests {
         for direct_rpc in [false, true] {
             state.call_returns_status = direct_rpc;
             assert_eq!(
-                unsafe { write_back_output_params(&mut state, &[snap(param)], &values, Some(19)) },
+                unsafe {
+                    write_back_output_params(
+                        &mut state,
+                        &[snap(param)],
+                        &ParamArrayHeader::default(),
+                        &values,
+                        Some(19),
+                    )
+                },
                 SQL_SUCCESS
             );
             assert_eq!(value, if direct_rpc { 19 } else { 37 });
@@ -404,6 +443,7 @@ mod tests {
                 write_back_output_params(
                     &mut state,
                     &[None, snap(param)],
+                    &ParamArrayHeader::default(),
                     &[returned("@P1", 0, ColumnValues::Int(7))],
                     None,
                 )
@@ -416,6 +456,7 @@ mod tests {
                 write_back_output_params(
                     &mut state,
                     &[None, snap(param)],
+                    &ParamArrayHeader::default(),
                     &[returned("", 1, ColumnValues::Int(9))],
                     None,
                 )
@@ -466,7 +507,15 @@ mod tests {
         ];
         let mut state = stmt.inner.lock().unwrap();
         assert_eq!(
-            unsafe { write_back_output_params(&mut state, &bindings, &values, None) },
+            unsafe {
+                write_back_output_params(
+                    &mut state,
+                    &bindings,
+                    &ParamArrayHeader::default(),
+                    &values,
+                    None,
+                )
+            },
             SQL_ERROR
         );
         let states: Vec<_> = state.diag_records.iter().map(|r| r.sql_state).collect();
@@ -486,7 +535,7 @@ mod tests {
             size_of::<i32>() as crate::api::odbc_types::SqlLen,
             &raw mut ind,
         );
-        let outcome = unsafe { write_value(&param, &ColumnValues::Int(4711)) };
+        let outcome = unsafe { write_value(&param, &ColumnValues::Int(4711), TextOutput::UTF8) };
         assert_eq!(outcome, RowOutcome::Success);
         assert_eq!(buf, 4711);
         assert_eq!(ind, size_of::<i32>() as crate::api::odbc_types::SqlLen);
@@ -509,7 +558,13 @@ mod tests {
             &raw mut ind,
         );
         let payload = vec![0x58u8, 0x59, 0x5A];
-        let outcome = unsafe { write_value(&param, &ColumnValues::Bytes(payload.clone())) };
+        let outcome = unsafe {
+            write_value(
+                &param,
+                &ColumnValues::Bytes(payload.clone()),
+                TextOutput::UTF8,
+            )
+        };
         assert_eq!(outcome, RowOutcome::Success);
         assert_eq!(&buf[..payload.len()], payload.as_slice());
         assert_eq!(ind, payload.len() as crate::api::odbc_types::SqlLen);
@@ -529,7 +584,7 @@ mod tests {
             &raw mut ind,
         );
         assert_eq!(
-            unsafe { write_value(&param, &ColumnValues::Null) },
+            unsafe { write_value(&param, &ColumnValues::Null, TextOutput::UTF8) },
             RowOutcome::Success
         );
         assert_eq!(ind, SQL_NULL_DATA as crate::api::odbc_types::SqlLen);
@@ -548,7 +603,7 @@ mod tests {
                 &raw mut indicator,
             );
             assert_eq!(
-                unsafe { write_value(&param, &ColumnValues::Null) },
+                unsafe { write_value(&param, &ColumnValues::Null, TextOutput::UTF8) },
                 RowOutcome::Success
             );
             assert_eq!(indicator, SQL_NULL_DATA);
@@ -568,7 +623,7 @@ mod tests {
             std::ptr::null_mut(),
         );
         assert!(matches!(
-            unsafe { write_value(&param, &ColumnValues::Null) },
+            unsafe { write_value(&param, &ColumnValues::Null, TextOutput::UTF8) },
             RowOutcome::Error(_)
         ));
     }
@@ -588,7 +643,7 @@ mod tests {
         );
         let value = ColumnValues::String(SqlString::new(b"abcdefgh".to_vec(), EncodingType::Utf8));
         assert_eq!(
-            unsafe { write_value(&param, &value) },
+            unsafe { write_value(&param, &value, TextOutput::UTF8) },
             RowOutcome::Info(crate::api::fetch_scroll::RowIssue::StringTruncated)
         );
     }

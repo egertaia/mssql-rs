@@ -63,18 +63,20 @@ msodbcsql build is measured.
    is **not** a deviation. `DefaultCTypeWideCharParam` and
    `DefaultCTypeGuidRoundTrips` carry `SKIP_IF_COMPARING_MSODBCSQL()` for the
    two parameter-side halves. Tracked in AB#47365.
-3. `SQL_C_CHAR` is **UTF-8** in both directions; the driver never reads or
-   writes the client code page. msodbcsql uses the client code page -
+3. Input `SQL_C_CHAR` parameters remain **UTF-8** pending AB#47565.
+   msodbcsql uses the client code page -
    `dwClientCodePage = SystemLocale::Singleton().AnsiCP()`
    (`odbc/sqlcprot.h:2830`), which is `GetACP()` on Windows
    (`Common/include/Localization.hpp:742`) and `nl_langinfo(CODESET)` elsewhere
    (`LocalizationImpl.hpp:386`); the parameter path reads it directly at
    `sqlcfunc.cpp:2913`. The two therefore agree under a UTF-8 locale and differ
-   on a default Windows one. Taken because mssql-python, the only supported
-   consumer, is UTF-8 native; the ODBC "C Data Types" appendix fixes no encoding
-   for `SQL_C_CHAR`, so neither choice is more conformant. Revisit if a second
-   consumer targets this driver on Windows. Tracked in AB#47564 (fetch) and
-   AB#47565 (parameters). `SQL_C_WCHAR` is UTF-16LE on both drivers.
+   on a default Windows one for narrow inputs. The original rationale that
+   mssql-python requires UTF-8 in both directions was incorrect: its default
+   text input and fetching use `SQL_C_WCHAR`, while explicit non-UTF-8 narrow
+   fetching on Windows exposes this difference.
+   AB#47564 removes the retrieval deviation: columns and output parameters
+   use platform client encoding, with native conversion and optional
+   `SQL_COPT_SS_WARN_ON_CP_ERROR` diagnostics. `SQL_C_WCHAR` remains UTF-16LE.
 4. **Narrow parameter length is measured after destination transcoding.**
    `varchar(n)` bounds bytes in the database collation, so both `SQL_C_CHAR`
    and `SQL_C_WCHAR` are converted to that encoding before the bound is
@@ -171,13 +173,27 @@ msodbcsql build is measured.
    `SKIP_IF_COMPARING_MSODBCSQL()`. Tracked in AB#47767.
 
    The same rule applies to a bound UTF-8-collation `varchar(max)` delivered as
-   `SQL_C_CHAR`, which is verbatim on both drivers because the wire bytes are
-   already UTF-8. Measured on build 173919 with a 3-byte character against an
+   `SQL_C_CHAR` with a UTF-8 client, which is verbatim on both drivers because
+   the wire and client encodings match. Measured on build 173919 with a 3-byte character against an
    8-byte payload slot: msodbcsql fills all 8 and returns
    `"\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD"`, ending mid-character, where this driver
    stops at 6. `ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary`
    splits per-leg on `ODBC_TEST_TARGET` rather than skipping, so the shared part
    — both truncate, report `01004`, and deliver a prefix — stays measured.
+
+   AB#47564 extends this driver's whole-character policy to native client
+   encodings for bound `SQL_C_CHAR` output from `nvarchar(max)` and JSON.
+   `ABoundNvarcharMaxTruncatesOnACharacterBoundary` and
+   `ABoundJsonTruncatesOnACharacterBoundary` compute the character width with
+   `Utf8ToNativeClient` and compare whole-character output against the reference
+   driver's byte-capacity prefix. This preserves valid client text rather than
+   introducing encoding-dependent partial characters. Evidence is limited to
+   the existing UTF-8 measurement above and the standard-locale comparison runs;
+   it does not establish retail behavior for every supported multibyte locale.
+   A non-UTF-8 multibyte-locale comparison recording `SQL_DRIVER_VER`, client
+   codeset, build, bytes, and indicator is still needed. Track that measurement
+   and explicit approval of the generalized deviation in AB#47564 / AB#47767;
+   neither is implied by the generalized test expectation.
 9. A bound `time` / `datetimeoffset` column strides by
     `sizeof(SQL_SS_TIME2_STRUCT)` (12) and
     `sizeof(SQL_SS_TIMESTAMPOFFSET_STRUCT)` (20) rather than by `BufferLength`.
@@ -653,7 +669,7 @@ msodbcsql build is measured.
     unmeasured) but not approved; record the approver and date in AB#47598
     before relying on this entry as settled.
 
-23. **`SQL_COPT_SS_WARN_ON_CP_ERROR` reports code-page loss on input
+23. **`SQL_COPT_SS_WARN_ON_CP_ERROR` also reports code-page loss on input
     parameters; msodbcsql reports it only on retrieval.** msodbcsql posts
     `IDS_01_000_16` ("Warning: Code page translation caused loss of data",
     SQLSTATE `01000` via `cli_common/src/clntcomn.cpp:1183`) from exactly two
@@ -665,13 +681,11 @@ msodbcsql build is measured.
     parameter, msodbcsql returns `SQL_SUCCESS` and posts nothing; this driver
     returns `SQL_SUCCESS_WITH_INFO` and posts `01000`.
 
-    Taken because the retrieval direction msodbcsql instruments cannot lose
-    anything here: this driver's `SQL_C_CHAR` is UTF-8 (entry 3), so any
-    character the server sends has a representation in the target buffer and
-    there is nothing to substitute. Applying the attribute to the direction
-    where loss actually occurs keeps it meaningful rather than inert. The
-    substitution itself is silent by default on both drivers, so an application
-    that never sets the attribute cannot tell them apart.
+    Initially applied to input parameters because retrieval was always UTF-8.
+    AB#47564 adds the native retrieval behavior for columns and output
+    parameters; input-parameter warnings remain an additional diagnostic rather
+    than being removed as part of the fetch change. Substitution remains
+    silent by default on both drivers.
 
     Four tests carry `SKIP_IF_COMPARING_MSODBCSQL()` for this entry:
     `UnmappableCharacterWarnsWhenAsked`,
@@ -845,3 +859,45 @@ msodbcsql build is measured.
     Introduced with AB#48943, which made the descriptor header the canonical
     storage behind the two array-size attributes; the rejection itself predates
     it on all three spellings.
+26. **A descriptor-header write that races an in-flight fetch or execute
+    through that descriptor is refused with `HY010`; msodbcsql applies it.**
+    msodbcsql has no statement-state check for these writes:
+    `SQLSetDescField`'s preconditions (`odbc/sqlcdesc.cpp`) check only handle
+    type, the IRD two-field whitelist, TVP nesting and `RecNumber`, then assign
+    `rgfArrayStatus` / `pRowsProcessed` unconditionally. `SQLSetStmtAttr`'s
+    `IsSetStmtOptionValid` (`odbc/sqlcmisc.cpp`) only range-checks these
+    attributes; its one `HY010` is scoped to setting `SQL_ATTR_ASYNC_ENABLE`
+    itself, so none of them is refused for statement state, async or not.
+
+    This driver refuses, through both spellings, a write to a descriptor that a
+    statement is currently fetching through (ARD or IRD,
+    `STMT_STATE_FETCH_IN_PROGRESS`) or executing through (APD or IPD,
+    `STMT_STATE_EXEC_STARTED`) — including a sibling statement sharing an
+    explicit ARD/APD (`DescHandle::readers_through`). The driver does not hold
+    the STMT lock across network I/O; fetch and execute snapshot these pointers
+    and sizes, so a write mid-call would desynchronize the snapshot from the
+    application's buffers. The check is advisory (instructions §7.2).
+
+    Reachable only by a call concurrent with the fetch/execute: a
+    single-threaded application cannot call during one, and the Driver Manager
+    already refuses descriptor writes during a Need Data sequence
+    (instructions §7.3).
+
+    Evidence level: source reading only. No `SQL_DRIVER_VER` or tested build is
+    recorded, and unlike entry 14 nothing prevents measuring this — the
+    concurrent call is a second *thread*, not a Driver-Manager-blocked path, and
+    ODBC's
+    [multithreading contract](https://learn.microsoft.com/sql/odbc/reference/develop-app/multithreading)
+    makes it a supported application path that reaches the driver normally. A
+    `--compare-with-msodbcsql` case that writes the descriptor from one thread
+    while another is blocked in `SQLFetch`/`SQLExecute` would close it. That
+    case does not exist yet: the e2e suite has no two-thread fixture outside
+    `session_recovery_test`, and the Rust unit tests reach the refusal by
+    setting `STMT_STATE_FETCH_IN_PROGRESS` / `STMT_STATE_EXEC_STARTED`
+    directly rather than through a real in-flight call. Until it does, treat
+    the msodbcsql half of this entry as read from source and not observed.
+
+    The ARD/APD half predates AB#49060; AB#49060 extended it to the IRD/IPD
+    status and rows-processed pointers, and to every header-alias attribute
+    plus `SQL_ROWSET_SIZE`, which is ARD-resident without being an alias and
+    so reaches the same `readers_through` walk through `set_desc_header`.

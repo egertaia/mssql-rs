@@ -18,6 +18,8 @@ use crate::api::odbc_types::{
     self, SQL_DESC_ALLOC_AUTO, SqlInteger, SqlLen, SqlPointer, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
 use crate::api::set_desc_field::datetime_interval_code_for;
+use crate::conversion::client_encoding::ClientEncoding;
+use crate::conversion::fetch_convert::TextOutput;
 use crate::conversion::param_convert::{DaeLengthLimit, DaePlan, DaeTranscode};
 use crate::error::{DiagRecord, HasDiagnostics};
 use crate::handles::desc::UdtNames;
@@ -37,13 +39,13 @@ pub(crate) struct ActivePlpStream {
     /// Wire encoding of the PLP column.
     pub(crate) encoding: PlpEncoding,
     /// Trailing odd wire byte from the previous read, awaiting its pair. Only
-    /// used on the UTF-16LE -> UTF-8 (`nvarchar(max)` -> `SQL_C_CHAR`) path,
+    /// used on the UTF-16LE -> client bytes (`nvarchar(max)` -> `SQL_C_CHAR`) path,
     /// where a chunk boundary can fall between the two bytes of a code unit.
     pub(crate) pending_byte: Option<u8>,
     /// High surrogate whose low half lands in the next chunk. Held back so the
     /// pair is transcoded together instead of each half becoming U+FFFD.
     pub(crate) pending_high_surrogate: Option<u16>,
-    /// Converted output that did not fit. Usually UTF-8, but a continuation
+    /// Converted native client output that did not fit, but a continuation
     /// also moves pending UTF-16 units here so either text target can drain
     /// their bytes verbatim, including a byte split after a target switch.
     pub(crate) pending_bytes: Vec<u8>,
@@ -52,6 +54,12 @@ pub(crate) struct ActivePlpStream {
     /// Character reads drain old carry before decoding new wire input, so
     /// this tag covers the entire byte buffer.
     pub(crate) pending_bytes_utf16: bool,
+    pub(crate) pending_bytes_encoding: ClientEncoding,
+    /// Substitution byte ranges relative to the undelivered converted carry.
+    pub(crate) pending_loss_ranges: Vec<std::ops::Range<usize>>,
+    /// Original UTF-8 chunk and delivered client-byte offset for native carry.
+    /// Retained only while converted output remains, to locate typed-switch boundaries.
+    pub(crate) pending_narrow_source: Option<(Vec<u8>, usize)>,
     /// Narrow wire encoding resolved from the column's collation (or UTF-8 for
     /// `json`, which carries none), or `None` when the column is not narrow
     /// text. This is a property of the *column*, so a target type that arrives
@@ -130,6 +138,9 @@ impl ActivePlpStream {
             pending_high_surrogate: None,
             pending_bytes: Vec::new(),
             pending_bytes_utf16: false,
+            pending_bytes_encoding: ClientEncoding::UTF8,
+            pending_loss_ranges: Vec::new(),
+            pending_narrow_source: None,
             narrow_encoding,
             narrow_decoder: None,
             narrow_decoder_finished: false,
@@ -141,6 +152,28 @@ impl ActivePlpStream {
             prefetched_reached_end: false,
             prefetch_error: None,
         }
+    }
+
+    pub(crate) fn drain_pending_bytes(&mut self, count: usize) -> bool {
+        let loss = self
+            .pending_loss_ranges
+            .iter()
+            .any(|range| range.start < count);
+        self.pending_loss_ranges.retain_mut(|range| {
+            if range.end <= count {
+                return false;
+            }
+            range.start = range.start.saturating_sub(count);
+            range.end -= count;
+            true
+        });
+        self.pending_bytes.drain(..count);
+        if self.pending_bytes.is_empty() {
+            self.pending_narrow_source = None;
+        } else if let Some((_, offset)) = self.pending_narrow_source.as_mut() {
+            *offset = offset.saturating_add(count);
+        }
+        loss
     }
 
     /// Builds the narrow decoder if this column has an encoding and no decoder
@@ -209,7 +242,15 @@ impl ActivePlpStream {
             .len()
             .saturating_sub(self.prefetched_offset);
         if remaining == 0 {
-            return None;
+            // Conversion overflow can outlive the final wire chunk. Preserve
+            // EOF while that output is drained instead of resuming the client.
+            return self.prefetched_reached_end.then_some((
+                0,
+                true,
+                self.prefetched_known_total,
+                self.prefetched_total_read_before
+                    .saturating_add(self.prefetched_offset),
+            ));
         }
 
         let read = remaining.min(out.len());
@@ -403,6 +444,7 @@ pub(crate) struct StmtHandle {
 #[derive(Debug)]
 pub(crate) struct StmtState {
     pub(crate) diag_records: Vec<DiagRecord>,
+    pub(crate) text_output: TextOutput,
     /// Column metadata from the most recent execution.
     pub(crate) column_metadata: Vec<ColumnMetadata>,
     /// UTF-16 column names built once when result metadata changes.
@@ -537,6 +579,10 @@ pub(crate) struct StmtState {
     pub(crate) partial_text_offset: Option<(usize, usize)>,
     /// Direct string path already validated for `(1-based column, C target type)`.
     pub(crate) direct_text_target: Option<(usize, SqlSmallInt)>,
+    /// Client-copy eligibility for the current captured value, independent of source validation.
+    pub(crate) captured_narrow_copy: Option<(ClientEncoding, bool)>,
+    #[cfg(test)]
+    pub(crate) captured_narrow_copy_scans: usize,
     /// Rows affected by the last execution, reported by `SQLRowCount`. `-1`
     /// means "not available" (no statement executed yet, a result-returning
     /// SELECT, DDL, or `SET NOCOUNT ON`) — matching msodbcsql's
@@ -548,21 +594,8 @@ pub(crate) struct StmtState {
     /// (in memory — no cursor or connection), mirroring msodbcsql's one
     /// result set per DML statement.
     pub(crate) pending_row_counts: VecDeque<i64>,
-    /// Application buffer that receives the count of rows fetched by a block
-    /// fetch (`SQL_ATTR_ROWS_FETCHED_PTR`); null when unset. The application
-    /// owns this buffer and must keep it valid across the fetch.
-    pub(crate) rows_fetched_ptr: *mut SqlULen,
-    /// Application array that receives per-row status codes
-    /// (`SQL_ATTR_ROW_STATUS_PTR`); null when unset.
-    pub(crate) row_status_ptr: *mut SqlUSmallInt,
-    /// Row binding orientation (`SQL_ATTR_ROW_BIND_TYPE`): `SQL_BIND_BY_COLUMN`
-    /// (0) for column-wise arrays, otherwise a row-struct byte size.
-    pub(crate) row_bind_type: SqlULen,
-    /// Application-supplied byte offset added to every bound column's data and
-    /// indicator pointer at fetch time (`SQL_ATTR_ROW_BIND_OFFSET_PTR`); null
-    /// when unset. Read at fetch rather than at bind, so the application can
-    /// move the whole rowset by updating the pointed-to value.
-    pub(crate) row_bind_offset_ptr: *mut SqlULen,
+    // The row-side header aliases (rows fetched, row status, row bind type and
+    // offset) live on the ARD/IRD, not here: see `handles::desc`.
     /// The active application row descriptor for `SQL_ATTR_APP_ROW_DESC`:
     /// `None` means "use the implicit ARD" (`StmtHandle::ard`); `Some` holds
     /// an explicitly-allocated descriptor associated by
@@ -628,10 +661,12 @@ pub(crate) struct StmtState {
 ///
 /// Every entry was measured against msodbcsql 18 rather than taken from the
 /// ODBC headers, because several defaults are driver choices rather than
-/// specification values: `SQL_ATTR_SIMULATE_CURSOR` reports `SQL_SC_UNIQUE`,
-/// `SQL_ROWSET_SIZE` reports 1, and `SQL_ATTR_CURSOR_SENSITIVITY` reports
-/// `SQL_INSENSITIVE` even though the header default is `SQL_UNSPECIFIED`.
-/// See `docs/attributes_plan.md` §8.
+/// specification values: `SQL_ATTR_SIMULATE_CURSOR` reports `SQL_SC_UNIQUE`
+/// and `SQL_ATTR_CURSOR_SENSITIVITY` reports `SQL_INSENSITIVE` even though the
+/// header default is `SQL_UNSPECIFIED`. See `docs/attributes_plan.md` §8.
+///
+/// Descriptor-resident attributes (`SQL_ROWSET_SIZE` and the header aliases)
+/// do not belong here even when unconsumed: they must follow a descriptor swap.
 const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
     (
         odbc_types::SQL_ATTR_CURSOR_SENSITIVITY,
@@ -641,7 +676,6 @@ const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
     (odbc_types::SQL_ATTR_MAX_LENGTH, 0),
     (odbc_types::SQL_ATTR_ASYNC_ENABLE, 0),
     (odbc_types::SQL_ATTR_KEYSET_SIZE, 0),
-    (odbc_types::SQL_ROWSET_SIZE, 1),
     (
         odbc_types::SQL_ATTR_SIMULATE_CURSOR,
         odbc_types::SQL_SC_UNIQUE,
@@ -650,12 +684,6 @@ const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
     (odbc_types::SQL_ATTR_USE_BOOKMARKS, 0),
     (odbc_types::SQL_ATTR_ENABLE_AUTO_IPD, 0),
     (odbc_types::SQL_ATTR_FETCH_BOOKMARK_PTR, 0),
-    (odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR, 0),
-    (odbc_types::SQL_ATTR_PARAM_BIND_TYPE, 0),
-    (odbc_types::SQL_ATTR_PARAM_OPERATION_PTR, 0),
-    (odbc_types::SQL_ATTR_PARAM_STATUS_PTR, 0),
-    (odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR, 0),
-    (odbc_types::SQL_ATTR_ROW_OPERATION_PTR, 0),
     (odbc_types::SQL_ATTR_METADATA_ID, 0),
 ];
 
@@ -665,18 +693,8 @@ const INERT_STMT_ATTRS: &[(SqlInteger, SqlULen)] = &[
 /// storing them is *not* without effect, so they must not be reported as
 /// ignored. Keep this in step with the consumers:
 /// - `SQL_ATTR_NOSCAN` via [`InertStmtAttrs::noscan`] (`prepare`, `exec_direct`,
-///   `execute`),
-/// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR` via [`InertStmtAttrs::param_bind_offset`],
-/// - the remaining parameter-array attributes, read by `execute` and
-///   `exec_common` when binding and reporting a parameter set.
-const HONOURED_INERT_STMT_ATTRS: &[SqlInteger] = &[
-    odbc_types::SQL_ATTR_NOSCAN,
-    odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR,
-    odbc_types::SQL_ATTR_PARAM_BIND_TYPE,
-    odbc_types::SQL_ATTR_PARAM_OPERATION_PTR,
-    odbc_types::SQL_ATTR_PARAM_STATUS_PTR,
-    odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR,
-];
+///   `execute`).
+const HONOURED_INERT_STMT_ATTRS: &[SqlInteger] = &[odbc_types::SQL_ATTR_NOSCAN];
 
 /// One bit per [`INERT_STMT_ATTRS`] entry, set the first time that attribute is
 /// reported as stored without effect.
@@ -701,7 +719,7 @@ const _: () = assert!(
 /// A flat array keyed by a linear scan is deliberate: the set is small and
 /// fixed, and holding the identifiers and their defaults in one auditable
 /// table keeps a measured default from drifting away from the attribute it
-/// belongs to, which nineteen separate struct fields would invite.
+/// belongs to, which one struct field per attribute would invite.
 #[derive(Debug, Clone)]
 pub(crate) struct InertStmtAttrs([SqlULen; INERT_STMT_ATTRS.len()]);
 
@@ -780,28 +798,6 @@ impl InertStmtAttrs {
             }
             None => false,
         }
-    }
-
-    /// Reads the byte offset `SQL_ATTR_PARAM_BIND_OFFSET_PTR` currently points
-    /// at, or 0 when the application has not set one.
-    ///
-    /// The attribute holds a *pointer to* the offset rather than the offset
-    /// itself, so the application can move every binding by writing one
-    /// `SQLLEN` between executions. It is therefore read at execute time, not
-    /// at set time.
-    ///
-    /// # Safety
-    /// When set, the pointer must address a live `SQLLEN` for the duration of
-    /// the execution, per the `SQLSetStmtAttr` contract. ODBC does not require
-    /// application pointers to be aligned.
-    pub(crate) unsafe fn param_bind_offset(&self) -> isize {
-        let ptr = self
-            .get(odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR)
-            .unwrap_or(0) as *const odbc_types::SqlLen;
-        if ptr.is_null() {
-            return 0;
-        }
-        unsafe { ptr.read_unaligned() }
     }
 }
 
@@ -1472,6 +1468,7 @@ impl StmtState {
         self.current_row_last_col = 0;
         self.partial_text_offset = None;
         self.direct_text_target = None;
+        self.captured_narrow_copy = None;
     }
 
     /// Positions the row stream on a freshly fetched row: clears all per-row
@@ -1624,6 +1621,7 @@ impl StmtHandle {
             ))),
             inner: Mutex::new(StmtState {
                 diag_records: Vec::new(),
+                text_output: TextOutput::UTF8,
                 column_metadata: Vec::new(),
                 column_names_utf16: Vec::new(),
                 plp_prefetch_scratch: Vec::new(),
@@ -1649,12 +1647,11 @@ impl StmtHandle {
                 current_row_last_col: 0,
                 partial_text_offset: None,
                 direct_text_target: None,
+                captured_narrow_copy: None,
+                #[cfg(test)]
+                captured_narrow_copy_scans: 0,
                 row_count: -1,
                 pending_row_counts: VecDeque::new(),
-                rows_fetched_ptr: std::ptr::null_mut(),
-                row_status_ptr: std::ptr::null_mut(),
-                row_bind_type: crate::api::odbc_types::SQL_BIND_BY_COLUMN,
-                row_bind_offset_ptr: std::ptr::null_mut(),
                 active_ard: None,
                 active_apd: None,
                 state_flags: 0,
@@ -1720,22 +1717,12 @@ mod tests {
     ///
     /// - `SQL_ATTR_NOSCAN` — `InertStmtAttrs::noscan`, read by `prepare`,
     ///   `exec_direct` and `execute`.
-    /// - `SQL_ATTR_PARAM_BIND_OFFSET_PTR` — `InertStmtAttrs::param_bind_offset`.
-    /// - the remaining parameter-array attributes — read by `execute` and
-    ///   `exec_common` when binding and reporting a parameter set.
     ///
     /// Removing a consumer means moving its attribute out of the list here,
     /// not just deleting the call site.
     #[test]
     fn the_honoured_inert_attributes_are_exactly_the_consumed_ones() {
-        let mut expected = vec![
-            odbc_types::SQL_ATTR_NOSCAN,
-            odbc_types::SQL_ATTR_PARAM_BIND_OFFSET_PTR,
-            odbc_types::SQL_ATTR_PARAM_BIND_TYPE,
-            odbc_types::SQL_ATTR_PARAM_OPERATION_PTR,
-            odbc_types::SQL_ATTR_PARAM_STATUS_PTR,
-            odbc_types::SQL_ATTR_PARAMS_PROCESSED_PTR,
-        ];
+        let mut expected = vec![odbc_types::SQL_ATTR_NOSCAN];
         let mut actual = HONOURED_INERT_STMT_ATTRS.to_vec();
         expected.sort_unstable();
         actual.sort_unstable();
@@ -1972,7 +1959,8 @@ mod tests {
             assert!(ColumnBinding::all_from_ard_state(s).is_empty());
         });
         let handle = StmtHandle::new(std::ptr::null_mut(), 0);
-        assert!(handle.inner.lock().unwrap().row_bind_offset_ptr.is_null());
+        let ard = unsafe { crate::handles::handle_from_raw::<DescHandle>(handle.ard) };
+        assert!(ard.inner.lock().unwrap().header.bind_offset_ptr.is_null());
     }
 
     #[test]
@@ -2043,6 +2031,11 @@ mod tests {
             Some((4, true, Some(14), 14))
         );
         assert_eq!(&second[..4], &[3, 4, 5, 6]);
+        assert_eq!(
+            stream.read_prefetched_wire(&mut second),
+            Some((0, true, Some(14), 14))
+        );
+        stream.take_prefetch_buffer();
         assert_eq!(stream.read_prefetched_wire(&mut second), None);
     }
 

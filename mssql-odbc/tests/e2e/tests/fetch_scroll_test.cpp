@@ -29,6 +29,34 @@
 #include <string>
 #include <vector>
 
+namespace {
+std::string RepeatedPrefix(const std::string& character, size_t capacity) {
+    std::string result;
+    if (character.empty()) return result;
+    while (character.size() <= capacity - result.size()) result += character;
+    return result;
+}
+
+std::string RepeatedBytePrefix(const std::string& character, size_t capacity) {
+    std::string result;
+    if (character.empty()) return result;
+    result.reserve(capacity);
+    while (result.size() < capacity) {
+        const size_t remaining = capacity - result.size();
+        result.append(character, 0, remaining < character.size() ? remaining : character.size());
+    }
+    return result;
+}
+
+std::string ExpectedBoundClientPrefix(const std::string& character, size_t capacity) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    if (target && std::string(target) == "msodbcsql") {
+        return RepeatedBytePrefix(character, capacity);
+    }
+    return RepeatedPrefix(character, capacity);
+}
+}
+
 class FetchScrollLiveTest : public ODBCTest {
 protected:
     void SetUp() override {
@@ -37,6 +65,13 @@ protected:
             FAIL() << "No connection configured – set ODBC_TEST_SERVER or ODBC_TEST_CONNSTR";
         }
         Connect();
+        SQLCHAR version[32] = {};
+        ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                      SQL_HANDLE_DBC, dbc_);
+        RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+#ifdef _WIN32
+        RecordProperty("client_code_page", static_cast<int>(GetACP()));
+#endif
     }
 
     // Three rows, so a rowset larger than the result set can be exercised.
@@ -54,16 +89,93 @@ protected:
     }
 };
 
-class FetchScrollUtf16Test : public FetchScrollLiveTest {
-protected:
-    void SetUp() override {
-        ASSERT_NO_FATAL_FAILURE(FetchScrollLiveTest::SetUp());
-        SQLCHAR version[32] = {};
-        ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
-                      SQL_HANDLE_DBC, dbc_);
-        RecordProperty("driver_version", reinterpret_cast<const char*>(version));
+class FetchScrollUtf16Test : public FetchScrollLiveTest {};
+
+TEST_F(FetchScrollLiveTest, BoundTextRowArraysUseClientEncoding) {
+    constexpr size_t row_count = 2;
+    unsigned char output[row_count][32] = {};
+    SQLLEN lengths[row_count] = {};
+    SQLUSMALLINT status[row_count] = {};
+    SQLULEN fetched = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                reinterpret_cast<SQLPOINTER>(row_count), 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, output, sizeof(output[0]), lengths), SQL_HANDLE_STMT, stmt_);
+    for (const char* expression : {
+            "CAST(NCHAR(233) + NCHAR(0x20AC) AS nvarchar(16))",
+            "CAST((NCHAR(233) + NCHAR(0x20AC)) COLLATE Latin1_General_100_CI_AS AS varchar(16))",
+            "CAST(NCHAR(233) + NCHAR(0x20AC) AS nvarchar(max))",
+            "CAST(CAST(NCHAR(233) + NCHAR(0x20AC) AS nvarchar(16)) AS sql_variant)"}) {
+        SCOPED_TRACE(expression);
+        ExecDirect(std::string("SELECT ") + expression + " FROM (VALUES(1), (2)) AS t(n)");
+        ASSERT_EQ(SQL_SUCCESS, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+        ASSERT_EQ(row_count, fetched);
+        const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9\xE2\x82\xAC");
+        for (size_t row = 0; row < row_count; ++row) {
+            EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(output[row]), expected.size()));
+            EXPECT_EQ(0, output[row][expected.size()]);
+            EXPECT_EQ(static_cast<SQLLEN>(expected.size()), lengths[row]);
+            EXPECT_EQ(SQL_ROW_SUCCESS, status[row]);
+        }
+        ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
     }
-};
+    SQLFreeStmt(stmt_, SQL_UNBIND);
+}
+
+TEST_F(FetchScrollLiveTest, BoundClientCodePageLossHonorsWarningAttribute) {
+    bool had_loss = false;
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xF0\x9F\x98\x80", &had_loss);
+    for (SQLULEN warn : {0UL, 1UL}) {
+        ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                       reinterpret_cast<SQLPOINTER>(warn), 0), SQL_HANDLE_DBC, dbc_);
+        SQLUINTEGER actual_warn = 99;
+        ASSERT_SQL_OK(SQLGetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR,
+                                       &actual_warn, sizeof(actual_warn), nullptr), SQL_HANDLE_DBC, dbc_);
+        ASSERT_EQ(warn, actual_warn);
+        for (const char* type : {"nvarchar(16)", "nvarchar(max)"}) {
+            SCOPED_TRACE(type);
+            SCOPED_TRACE(warn);
+            for (SQLLEN capacity : {16, 2}) {
+                SCOPED_TRACE(capacity);
+                ExecDirect(std::string("SELECT CAST(NCHAR(0xD83D) + NCHAR(0xDE00) AS ") + type + ")");
+                unsigned char output[16] = {};
+                SQLLEN length = -99;
+                ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, output, capacity, &length), SQL_HANDLE_STMT, stmt_);
+                const bool truncated = expected.size() >= static_cast<size_t>(capacity);
+                EXPECT_EQ(truncated ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS, SQLFetch(stmt_));
+                bool saw_truncation = false;
+                bool saw_loss = false;
+                for (SQLSMALLINT record = 1;; ++record) {
+                    SQLCHAR state[6] = {};
+                    SQLCHAR message[256] = {};
+                    SQLINTEGER native = 0;
+                    SQLSMALLINT size = 0;
+                    const auto rc = SQLGetDiagRecA(SQL_HANDLE_STMT, stmt_, record, state,
+                                                   &native, message, sizeof(message), &size);
+                    if (rc == SQL_NO_DATA) break;
+                    ASSERT_SQL_OK(rc, SQL_HANDLE_STMT, stmt_);
+                    const std::string sqlstate(reinterpret_cast<const char*>(state));
+                    saw_truncation |= sqlstate == "01004";
+                    saw_loss |= sqlstate == "01000";
+                    EXPECT_TRUE(sqlstate == "01004" || sqlstate == "01000");
+                }
+                EXPECT_EQ(truncated, saw_truncation);
+                EXPECT_EQ(truncated && warn && had_loss, saw_loss);
+                if (!truncated) {
+                    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(output), expected.size()));
+                    EXPECT_EQ(0, output[expected.size()]);
+                    EXPECT_EQ(static_cast<SQLLEN>(expected.size()), length);
+                } else if (had_loss && expected.size() == 2) {
+                    EXPECT_EQ(expected.substr(0, 1), reinterpret_cast<const char*>(output));
+                }
+                ASSERT_SQL_OK(SQLCloseCursor(stmt_), SQL_HANDLE_STMT, stmt_);
+                ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+            }
+        }
+    }
+    ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_COPT_SS_WARN_ON_CP_ERROR, nullptr, 0), SQL_HANDLE_DBC, dbc_);
+}
 
 TEST_F(FetchScrollUtf16Test, RawUnitsInBoundRowArrays) {
     constexpr size_t row_count = 4;
@@ -609,6 +721,388 @@ TEST_F(FetchScrollLiveTest, DescriptorArraySizeSizesTheRowset) {
     EXPECT_EQ(0u, rowsFetched);
     SQLCloseCursor(stmt_);
 }
+
+// AB#49060: rowset controls set only through the ARD/IRD descriptor fields
+// drive the fetch.
+TEST_F(FetchScrollLiveTest, DescriptorSpellingsDriveTheBlockFetch) {
+    ExecThreeRows();
+
+    SQLHDESC ard = SQL_NULL_HDESC;
+    SQLHDESC ird = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, &ard, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_ROW_DESC, &ird, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // The offset skips two SQLINTEGER values and one SQLLEN indicator.
+    std::vector<SQLINTEGER> values(5, -1);
+    std::vector<SQLLEN> indicators(4, -7);
+    std::vector<SQLUSMALLINT> status(3, 0xFFFF);
+    SQLULEN rowsFetched = 999;
+    SQLLEN offset = sizeof(SQLLEN);
+
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, ard);
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_BIND_OFFSET_PTR, &offset, 0),
+                  SQL_HANDLE_DESC, ard);
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ROWS_PROCESSED_PTR, &rowsFetched, 0),
+                  SQL_HANDLE_DESC, ird);
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ARRAY_STATUS_PTR, status.data(), 0),
+                  SQL_HANDLE_DESC, ird);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values.data(), sizeof(SQLINTEGER),
+                             indicators.data()),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, rowsFetched) << "IRD SQL_DESC_ROWS_PROCESSED_PTR received the count";
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(SQL_ROW_SUCCESS, status[i]) << "IRD status array, row " << i;
+    }
+    EXPECT_EQ(-1, values[0]) << "ARD SQL_DESC_BIND_OFFSET_PTR displaced the rowset";
+    EXPECT_EQ(-1, values[1]);
+    EXPECT_EQ(1, values[2]);
+    EXPECT_EQ(2, values[3]);
+    EXPECT_EQ(3, values[4]);
+    EXPECT_EQ(-7, indicators[0]) << "the indicator slack is untouched";
+    SQLCloseCursor(stmt_);
+}
+
+// AB#49060: each row-side attribute and its descriptor field are one value.
+TEST_F(FetchScrollLiveTest, RowAttributesAndDescriptorFieldsAgree) {
+    // Executed first for the IRD cases below: SQLGet/SetDescField on an IRD is
+    // HY007 ("associated statement is not prepared") unless the statement is
+    // prepared or executed. unixODBC enforces that; the Windows DM does not.
+    ExecThreeRows();
+
+    SQLHDESC ard = SQL_NULL_HDESC;
+    SQLHDESC ird = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, &ard, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_IMP_ROW_DESC, &ird, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLLEN offset = 0;
+    SQLUSMALLINT operations[2] = {};
+    SQLUSMALLINT status[2] = {};
+    SQLULEN fetched = 0;
+    struct Case {
+        SQLINTEGER attribute;
+        SQLHDESC desc;
+        SQLSMALLINT field;
+        SQLPOINTER value;
+    };
+    const Case cases[] = {
+        {SQL_ATTR_ROW_BIND_OFFSET_PTR, ard, SQL_DESC_BIND_OFFSET_PTR, &offset},
+        {SQL_ATTR_ROW_OPERATION_PTR, ard, SQL_DESC_ARRAY_STATUS_PTR, operations},
+        {SQL_ATTR_ROW_STATUS_PTR, ird, SQL_DESC_ARRAY_STATUS_PTR, status},
+        {SQL_ATTR_ROWS_FETCHED_PTR, ird, SQL_DESC_ROWS_PROCESSED_PTR, &fetched},
+    };
+    for (const Case& c : cases) {
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, c.attribute, c.value, 0), SQL_HANDLE_STMT,
+                      stmt_);
+        SQLPOINTER read = nullptr;
+        ASSERT_SQL_OK(SQLGetDescField(c.desc, 0, c.field, &read, 0, nullptr),
+                      SQL_HANDLE_DESC, c.desc);
+        EXPECT_EQ(c.value, read) << "attribute " << c.attribute << " -> field " << c.field;
+
+        ASSERT_SQL_OK(SQLSetDescField(c.desc, 0, c.field, nullptr, 0), SQL_HANDLE_DESC,
+                      c.desc);
+        read = &offset;
+        ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, c.attribute, &read, 0, nullptr),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(nullptr, read) << "field " << c.field << " -> attribute " << c.attribute;
+    }
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_TYPE,
+                                 reinterpret_cast<SQLPOINTER>(24), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER bindType = 0;
+    ASSERT_SQL_OK(SQLGetDescField(ard, 0, SQL_DESC_BIND_TYPE, &bindType, 0, nullptr),
+                  SQL_HANDLE_DESC, ard);
+    EXPECT_EQ(24, bindType);
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_BIND_TYPE,
+                                  reinterpret_cast<SQLPOINTER>(SQL_BIND_BY_COLUMN), 0),
+                  SQL_HANDLE_DESC, ard);
+    SQLULEN reported = 99;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_TYPE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_BIND_BY_COLUMN), reported);
+    SQLCloseCursor(stmt_);
+}
+
+// AB#49060: SQL_ROWSET_SIZE lives on the ARD (msodbcsql `ADTag::dwRowSetSize`),
+// so it follows an ARD association.
+TEST_F(FetchScrollLiveTest, RowsetSizeFollowsTheAssociatedArd) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ROWSET_SIZE, reinterpret_cast<SQLPOINTER>(5), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLHDESC implicit_ard = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, &implicit_ard, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+
+    SQLHDESC explicit_ard = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &explicit_ard), SQL_HANDLE_DBC,
+                  dbc_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, explicit_ard, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLULEN reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ROWSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(1u, reported) << "the newly associated ARD's own default";
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, implicit_ard, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    reported = 0;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ROWSET_SIZE, &reported, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(5u, reported) << "the implicit ARD kept its value";
+    SQLFreeHandle(SQL_HANDLE_DESC, explicit_ard);
+}
+
+// AB#49060 parity audit: expectations below were measured on msodbcsql first.
+
+namespace {
+SQLHDESC StmtDesc(SQLHSTMT stmt, SQLINTEGER which) {
+    SQLHDESC desc = SQL_NULL_HDESC;
+    EXPECT_SQL_OK(SQLGetStmtAttr(stmt, which, &desc, 0, nullptr), SQL_HANDLE_STMT, stmt);
+    return desc;
+}
+
+SQLULEN StmtULen(SQLHSTMT stmt, SQLINTEGER attribute) {
+    SQLULEN value = 0xDEADBEEF;
+    EXPECT_SQL_OK(SQLGetStmtAttr(stmt, attribute, &value, 0, nullptr), SQL_HANDLE_STMT,
+                  stmt);
+    return value;
+}
+} // namespace
+
+// A row that fails conversion still counts as fetched (msodbcsql FetchRows).
+TEST_F(FetchScrollLiveTest, RowsFetchedCountsAnErrorRowInTheRowset) {
+    ExecDirect("SELECT CAST(1 AS INT) AS c UNION ALL SELECT 300 UNION ALL SELECT 2 "
+               "ORDER BY c");
+    SQLHDESC ird = StmtDesc(stmt_, SQL_ATTR_IMP_ROW_DESC);
+    signed char v[3] = {42, 42, 42};
+    SQLLEN ind[3] = {0, 0, 0};
+    SQLUSMALLINT status[3] = {0xFFFF, 0xFFFF, 0xFFFF};
+    SQLULEN fetched = 99;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ROWS_PROCESSED_PTR, &fetched, 0),
+                  SQL_HANDLE_DESC, ird);
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ARRAY_STATUS_PTR, status, 0),
+                  SQL_HANDLE_DESC, ird);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_STINYINT, v, sizeof(signed char), ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "22003");
+    EXPECT_EQ(3u, fetched) << "the error row is still a fetched row";
+    EXPECT_EQ(SQL_ROW_SUCCESS, status[0]);
+    EXPECT_EQ(SQL_ROW_SUCCESS, status[1]);
+    EXPECT_EQ(SQL_ROW_ERROR, status[2]) << "300 does not fit a signed byte";
+    SQLCloseCursor(stmt_);
+}
+
+// A truncated row: msodbcsql reports SQL_ROW_ERROR through SQLFetch and
+// SQL_ROW_SUCCESS_WITH_INFO through SQLFetchScroll; mssql-odbc reports the
+// latter through both (see `RowOutcome::status`). Each leg asserts its own.
+TEST_F(FetchScrollLiveTest, TruncatedRowStatusThroughSQLFetchAndSQLFetchScroll) {
+    const char* target = std::getenv("ODBC_TEST_TARGET");
+    const bool reference = target && std::string(target) == "msodbcsql";
+    for (bool scroll : {false, true}) {
+        SCOPED_TRACE(scroll ? "SQLFetchScroll" : "SQLFetch");
+        ExecDirect("SELECT 'abcdef' AS s UNION ALL SELECT 'gh' ORDER BY s");
+        char text[2][4] = {};
+        SQLLEN len[2] = {0, 0};
+        SQLUSMALLINT status[2] = {0xFFFF, 0xFFFF};
+        SQLULEN fetched = 99;
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                     reinterpret_cast<SQLPOINTER>(2), 0),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_STATUS_PTR, status, 0),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                      SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, text, sizeof(text[0]), len),
+                      SQL_HANDLE_STMT, stmt_);
+
+        const SQLRETURN rc = scroll ? SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0)
+                                    : SQLFetch(stmt_);
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, rc);
+        EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
+        EXPECT_EQ(2u, fetched);
+        const SQLUSMALLINT truncated =
+            (reference && !scroll) ? SQL_ROW_ERROR : SQL_ROW_SUCCESS_WITH_INFO;
+        EXPECT_EQ(truncated, status[0]) << "'abcdef' truncated to 3 bytes";
+        EXPECT_EQ(SQL_ROW_SUCCESS, status[1]);
+        EXPECT_STREQ("abc", text[0]);
+        EXPECT_EQ(6, len[0]) << "the full length is still reported";
+        SQLFreeStmt(stmt_, SQL_UNBIND);
+        SQLCloseCursor(stmt_);
+    }
+}
+
+// A fetch refused by validation leaves the rows-fetched buffer alone.
+TEST_F(FetchScrollLiveTest, ARefusedFetchLeavesRowsFetchedAlone) {
+    ExecThreeRows();
+    SQLULEN fetched = 77;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_ERROR, SQLFetchScroll(stmt_, SQL_FETCH_PRIOR, 0));
+    EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "HY106");
+    EXPECT_EQ(77u, fetched);
+    SQLCloseCursor(stmt_);
+}
+
+// The bind offset is read per fetch, including after repointing it via the ARD.
+TEST_F(FetchScrollLiveTest, TheRowBindOffsetIsReadOnEveryFetch) {
+    ExecThreeRows();
+    SQLHDESC ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
+    SQLINTEGER values[3] = {-1, -1, -1};
+    SQLLEN ind[3] = {0, 0, 0};
+    SQLLEN offset = 0;
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_OFFSET_PTR, &offset, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(SQLINTEGER), ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    offset = sizeof(SQLINTEGER);  // the indicator moves by the same 4 bytes
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLLEN repointed = 2 * sizeof(SQLINTEGER);
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_BIND_OFFSET_PTR, &repointed, 0),
+                  SQL_HANDLE_DESC, ard);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    EXPECT_EQ(1, values[0]);
+    EXPECT_EQ(2, values[1]);
+    EXPECT_EQ(3, values[2]);
+    SQLCloseCursor(stmt_);
+}
+
+// The array size and rows-fetched pointer can change between fetches.
+TEST_F(FetchScrollLiveTest, RowsetControlsCanChangeBetweenFetches) {
+    ExecDirect("SELECT n FROM (VALUES (1), (2), (3), (4), (5), (6)) AS t(n) ORDER BY n");
+    SQLHDESC ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
+    SQLHDESC ird = StmtDesc(stmt_, SQL_ATTR_IMP_ROW_DESC);
+    SQLINTEGER values[3] = {};
+    SQLLEN ind[3] = {};
+    SQLULEN fetched = 0;
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, values, sizeof(SQLINTEGER), ind),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0),
+                  SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(2), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(2u, fetched);
+    EXPECT_EQ(2, values[1]);
+
+    ASSERT_SQL_OK(SQLSetDescField(ard, 0, SQL_DESC_ARRAY_SIZE,
+                                  reinterpret_cast<SQLPOINTER>(3), 0),
+                  SQL_HANDLE_DESC, ard);
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(3u, fetched);
+    EXPECT_EQ(3, values[0]);
+    EXPECT_EQ(5, values[2]);
+
+    ASSERT_SQL_OK(SQLSetDescField(ird, 0, SQL_DESC_ROWS_PROCESSED_PTR, nullptr, 0),
+                  SQL_HANDLE_DESC, ird);
+    fetched = 77;
+    ASSERT_SQL_OK(SQLFetchScroll(stmt_, SQL_FETCH_NEXT, 0), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(77u, fetched) << "a cleared pointer is no longer written";
+    EXPECT_EQ(6, values[0]);
+    SQLCloseCursor(stmt_);
+}
+
+// One explicit descriptor as one statement's ARD and another's APD has one
+// header (from msodbcsql's DescFpp suite).
+TEST_F(FetchScrollLiveTest, OneDescriptorAsArdAndApdSharesEveryHeaderAlias) {
+    SQLHSTMT other = AllocStmt();
+    SQLHDESC shared = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &shared), SQL_HANDLE_DBC, dbc_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, shared, 0), SQL_HANDLE_STMT,
+                  stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(other, SQL_ATTR_APP_PARAM_DESC, shared, 0),
+                  SQL_HANDLE_STMT, other);
+
+    SQLLEN offset = 0;
+    SQLUSMALLINT operations[2] = {};
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(7), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_OFFSET_PTR, &offset, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(other, SQL_ATTR_PARAM_BIND_TYPE,
+                                 reinterpret_cast<SQLPOINTER>(16), 0),
+                  SQL_HANDLE_STMT, other);
+    ASSERT_SQL_OK(SQLSetStmtAttr(other, SQL_ATTR_PARAM_OPERATION_PTR, operations, 0),
+                  SQL_HANDLE_STMT, other);
+
+    EXPECT_EQ(7u, StmtULen(other, SQL_ATTR_PARAMSET_SIZE));
+    EXPECT_EQ(reinterpret_cast<SQLULEN>(&offset),
+              StmtULen(other, SQL_ATTR_PARAM_BIND_OFFSET_PTR));
+    EXPECT_EQ(16u, StmtULen(stmt_, SQL_ATTR_ROW_BIND_TYPE));
+    EXPECT_EQ(reinterpret_cast<SQLULEN>(operations),
+              StmtULen(stmt_, SQL_ATTR_ROW_OPERATION_PTR));
+
+    FreeStmt(other);
+    SQLFreeHandle(SQL_HANDLE_DESC, shared);
+}
+
+// Freeing an associated ARD reverts the row aliases to the implicit ARD's.
+TEST_F(FetchScrollLiveTest, FreeingTheAssociatedArdRevertsTheRowAliases) {
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(4), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLHDESC implicit_ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
+    SQLHDESC explicit_ard = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLAllocHandle(SQL_HANDLE_DESC, dbc_, &explicit_ard), SQL_HANDLE_DBC,
+                  dbc_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_APP_ROW_DESC, explicit_ard, 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_ARRAY_SIZE,
+                                 reinterpret_cast<SQLPOINTER>(9), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_TYPE,
+                                 reinterpret_cast<SQLPOINTER>(24), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(9u, StmtULen(stmt_, SQL_ATTR_ROW_ARRAY_SIZE));
+
+    ASSERT_SQL_OK(SQLFreeHandle(SQL_HANDLE_DESC, explicit_ard), SQL_HANDLE_DESC,
+                  explicit_ard);
+    EXPECT_EQ(implicit_ard, StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC));
+    EXPECT_EQ(4u, StmtULen(stmt_, SQL_ATTR_ROW_ARRAY_SIZE));
+    EXPECT_EQ(static_cast<SQLULEN>(SQL_BIND_BY_COLUMN),
+              StmtULen(stmt_, SQL_ATTR_ROW_BIND_TYPE));
+}
+
+// Both spellings store a bind type wider than SQLINTEGER; SQLGetDescField
+// reports the low 32 bits.
+#if defined(_WIN64) || defined(__LP64__)
+TEST_F(FetchScrollLiveTest, AWideBindTypeIsStoredWholeThroughEitherSpelling) {
+    SQLHDESC ard = StmtDesc(stmt_, SQL_ATTR_APP_ROW_DESC);
+    const SQLULEN wide = (static_cast<SQLULEN>(1) << 32) | 0x18;
+
+    ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_ATTR_ROW_BIND_TYPE,
+                                 reinterpret_cast<SQLPOINTER>(wide), 0),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(wide, StmtULen(stmt_, SQL_ATTR_ROW_BIND_TYPE));
+    SQLINTEGER narrow = -1;
+    ASSERT_SQL_OK(SQLGetDescField(ard, 0, SQL_DESC_BIND_TYPE, &narrow, 0, nullptr),
+                  SQL_HANDLE_DESC, ard);
+    EXPECT_EQ(0x18, narrow);
+
+    const SQLULEN over_int32 = static_cast<SQLULEN>(0x80000000u);
+    EXPECT_EQ(SQL_SUCCESS, SQLSetDescField(ard, 0, SQL_DESC_BIND_TYPE,
+                                           reinterpret_cast<SQLPOINTER>(over_int32), 0))
+        << ODBCTestUtils::GetDiagMessage(SQL_HANDLE_DESC, ard);
+    EXPECT_EQ(over_int32, StmtULen(stmt_, SQL_ATTR_ROW_BIND_TYPE));
+}
+#endif
 
 TEST_F(FetchScrollLiveTest, ReportsRowsFetched) {
     ExecThreeRows();
@@ -1380,18 +1874,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationWhenWidening) {
     SQLCloseCursor(stmt_);
 }
 
-// SQL_C_CHAR output is UTF-8, so a CP1252 varchar(max) must be decoded through
-// the column's collation on the bound path exactly as on the SQLGetData path
-// (AB#47566). A verbatim copy delivers the raw 0xE9 here, which is not valid
-// UTF-8 -- the same defect AB#47875 caught through mssql-python, one file over.
-//
-// Not skipped on the msodbcsql leg: both drivers deliver UTF-8 for SQL_C_CHAR
-// on Linux, so they must agree.
+// Decode through the source collation, then encode for the client (AB#47564).
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
-    // Windows-only skip: msodbcsql returns the raw CP1252 byte E9 with
-    // indicator 1 there, rather than UTF-8 C3 A9 with indicator 2 (AB#47564).
-    // Measured as agreeing on Linux in build 173873.
-    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
     ExecDirect(
         "SELECT CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)) AS c1");
 
@@ -1400,8 +1884,9 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxUsesItsCollationForChar) {
     ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
                   stmt_);
     EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
-    EXPECT_STREQ("\xC3\xA9", reinterpret_cast<const char*>(buf));
-    EXPECT_EQ(2, ind) << "one character, two UTF-8 bytes";
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9");
+    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(buf), expected.size()));
+    EXPECT_EQ(static_cast<SQLLEN>(expected.size()), ind);
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }
@@ -1437,14 +1922,14 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
         SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
 
-    const std::string token = "\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
-                              "abc";  // 你好世界abc
+    const std::string token = ODBCTestUtils::Utf8ToNativeClient("\xE4\xBD\xA0\xE5\xA5\xBD\xE4\xB8\x96\xE7\x95\x8C"
+                                        "abc");  // 你好世界abc
     std::string expected;
     expected.reserve(token.size() * 3000);
     for (int i = 0; i < 3000; ++i) {
         expected += token;
     }
-    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(buf.data())));
+    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(buf.data()), expected.size()));
     EXPECT_EQ(static_cast<SQLLEN>(expected.size()), ind);
     EXPECT_EQ(std::string::npos, expected.find("\xEF\xBF\xBD")) << "no U+FFFD";
     SQLFreeStmt(stmt_, SQL_UNBIND);
@@ -1452,7 +1937,9 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsCarriesCharactersAcrossWireChunk
 }
 
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource) {
-    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
+        GTEST_SKIP() << "This regression pins UTF-8 client length estimates";
+    }
     SQLCHAR version[32] = {};
     ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
                   SQL_HANDLE_DBC, dbc_);
@@ -1480,9 +1967,9 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource) {
         ASSERT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
         EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
         const std::string character = "\xE4\xBD\xA0";
-        const std::string prefix = buffer_length == 7 ?
+        const std::string expected = buffer_length == 7 ?
             character + character : character + character + character;
-        EXPECT_EQ(0, std::memcmp(output.data() + 1, prefix.c_str(), prefix.size() + 1));
+        EXPECT_EQ(0, std::memcmp(output.data() + 1, expected.c_str(), expected.size() + 1));
         EXPECT_EQ(0xCC, output.front());
         EXPECT_EQ(0xCC, output.back());
         EXPECT_EQ(buffer_length == 7 ? 214 : 215, indicator)
@@ -1504,11 +1991,9 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxDbcsTruncationCountsHeldSource) {
 // 5008 under C.UTF-8. Bound delivery uses the same estimate and raw-drains the
 // discarded tail instead of converting all 10,000 UTF-8 bytes.
 TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) {
-    // Windows-only skip: the payload assertion expects UTF-8, which msodbcsql
-    // does not deliver there (AB#47564), and its ANSI output also changes how
-    // many characters fit in the slot. The indicator comparison below is
-    // measured on the Linux leg, where both drivers deliver UTF-8.
-    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
+    if (ODBCTestUtils::Utf8ToNativeClient("\xE2\x82\xAC") != "\xE2\x82\xAC") {
+        GTEST_SKIP() << "This regression pins UTF-8 client length estimates";
+    }
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(233) COLLATE SQL_Latin1_General_CP1_CI_AS AS VARCHAR(MAX)), "
         "5000) AS c1");
@@ -1521,9 +2006,8 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
-    EXPECT_NE(SQL_NO_TOTAL, ind) << "known-length CHAR->CHAR includes converted bytes";
-    EXPECT_STREQ("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9", reinterpret_cast<const char*>(buf));
-
+    EXPECT_EQ(RepeatedPrefix("\xC3\xA9", sizeof(buf) - 1),
+              reinterpret_cast<const char*>(buf));
     EXPECT_EQ(5008, ind) << "4992 unread bytes + 16 converted bytes (emitted and carry)";
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
@@ -1547,7 +2031,6 @@ TEST_F(FetchScrollLiveTest, ABoundVarcharMaxTruncatedToCharKeepsConcreteLength) 
 // drivers truncate, report 01004, and deliver a prefix of the value -- stays
 // measured against msodbcsql.
 TEST_F(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBoundary) {
-    SKIP_IF_COMPARING_MSODBCSQL_ON_WINDOWS();
     ExecDirect(
         "SELECT REPLICATE(CAST(NCHAR(0x4F60) "
         "COLLATE Latin1_General_100_CI_AS_SC_UTF8 AS VARCHAR(MAX)), 500) AS c1");
@@ -1560,6 +2043,15 @@ TEST_F(FetchScrollLiveTest, ABoundUtf8CollationVarcharMaxTruncatesOnACharacterBo
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
+    const auto native_character = ODBCTestUtils::Utf8ToNativeClient("\xE4\xBD\xA0");
+    if (native_character != "\xE4\xBD\xA0") {
+        const auto expected = RepeatedPrefix(native_character, sizeof(buf) - 1);
+        EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(buf), expected.size()));
+        EXPECT_EQ(0, buf[expected.size()]);
+        SQLFreeStmt(stmt_, SQL_UNBIND);
+        SQLCloseCursor(stmt_);
+        return;
+    }
     const std::string got(reinterpret_cast<const char*>(buf));
     const std::string kSource = "\xE4\xBD\xA0\xE4\xBD\xA0\xE4\xBD\xA0";  // 你你你
 
@@ -1733,16 +2225,8 @@ TEST_F(FetchScrollLiveTest, AOversizedBoundVarcharMaxTypedConversionIsRefusedAnd
     SQLCloseCursor(stmt_);
 }
 
-// Non-ASCII, to prove the transcode is not a byte copy: each e-acute is two
-// UTF-16 bytes on the wire and two UTF-8 bytes delivered.
-//
-// Skipped on the msodbcsql leg because it asserts UTF-8 specifically. This
-// driver always delivers SQL_C_CHAR as UTF-8; msodbcsql converts to the client
-// code page, so on a Windows client the same value arrives as one 0xE9 byte per
-// character. That is the documented divergence AB#47564, and it is invisible on
-// Linux only because the client code page there is already UTF-8.
+// Non-ASCII proves that the output is transcoded to the native client encoding.
 TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii) {
-    SKIP_IF_COMPARING_MSODBCSQL();
     ExecDirect("SELECT CAST(REPLICATE(NCHAR(233), 4) AS NVARCHAR(MAX)) AS c1");
 
     unsigned char buf[64] = {};
@@ -1750,21 +2234,17 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTranscodesNonAscii) {
     ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_CHAR, buf, sizeof(buf), &ind), SQL_HANDLE_STMT,
                   stmt_);
     EXPECT_EQ(SQL_SUCCESS, SQLFetch(stmt_));
-    EXPECT_EQ(8, ind) << "four characters, two UTF-8 bytes each";
-    for (int i = 0; i < 4; ++i) {
-        EXPECT_EQ(0xC3u, buf[i * 2]);
-        EXPECT_EQ(0xA9u, buf[i * 2 + 1]);
-    }
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9\xC3\xA9\xC3\xA9\xC3\xA9");
+    EXPECT_EQ(static_cast<SQLLEN>(expected.size()), ind);
+    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(buf), expected.size()));
+    EXPECT_EQ(0, buf[expected.size()]);
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }
 
-// Truncation has to stop on a character boundary. Each e-acute is two UTF-8
-// bytes, so a 32-byte buffer holds 15 of them in 30 bytes and the 16th does not
-// fit -- delivering its lead byte alone would leave the caller with text that
-// does not decode. msodbcsql trims the same way (TrimPartialCodePt).
+// This driver keeps complete client characters, while msodbcsql truncates at
+// the output byte capacity even when that splits a multibyte character.
 TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
-    SKIP_IF_COMPARING_MSODBCSQL();  // asserts UTF-8; see AB#47564 above
     ExecDirect("SELECT REPLICATE(CAST(NCHAR(233) AS NVARCHAR(MAX)), 5000) AS c1");
 
     unsigned char buf[32] = {};
@@ -1774,19 +2254,15 @@ TEST_F(FetchScrollLiveTest, ABoundNvarcharMaxTruncatesOnACharacterBoundary) {
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
-    const size_t len = std::strlen(reinterpret_cast<const char*>(buf));
-    EXPECT_EQ(30u, len) << "15 whole characters, not 31 bytes ending mid-sequence";
-    ASSERT_EQ(0u, len % 2u);
-    for (size_t i = 0; i < len; i += 2) {
-        EXPECT_EQ(0xC3u, buf[i]) << "lead byte at " << i;
-        EXPECT_EQ(0xA9u, buf[i + 1]) << "continuation byte at " << (i + 1);
-    }
+    const auto expected = ExpectedBoundClientPrefix(ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9"),
+                                                    sizeof(buf) - 1);
+    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(buf), expected.size()));
+    EXPECT_EQ(0, buf[expected.size()]);
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }
 
 TEST_F(FetchScrollLiveTest, ABoundJsonTruncatesOnACharacterBoundary) {
-    SKIP_IF_COMPARING_MSODBCSQL();  // asserts UTF-8; see AB#47564 above
     if (!ServerSupportsNativeJson()) {
         GTEST_SKIP() << "server has no native json type";
     }
@@ -1800,14 +2276,11 @@ TEST_F(FetchScrollLiveTest, ABoundJsonTruncatesOnACharacterBoundary) {
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, SQLFetch(stmt_));
     EXPECT_SQLSTATE(SQL_HANDLE_STMT, stmt_, "01004");
 
-    const size_t len = std::strlen(reinterpret_cast<const char*>(buf));
-    EXPECT_EQ(8u, len) << "three whole e-acute characters after the JSON prefix";
-    EXPECT_EQ('[', buf[0]);
-    EXPECT_EQ('"', buf[1]);
-    for (size_t i = 2; i < len; i += 2) {
-        EXPECT_EQ(0xC3u, buf[i]) << "lead byte at " << i;
-        EXPECT_EQ(0xA9u, buf[i + 1]) << "continuation byte at " << (i + 1);
-    }
+    const auto prefix = ODBCTestUtils::Utf8ToNativeClient("[\"");
+    const auto expected = prefix + ExpectedBoundClientPrefix(ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9"),
+                                                             sizeof(buf) - 1 - prefix.size());
+    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(buf), expected.size()));
+    EXPECT_EQ(0, buf[expected.size()]);
     SQLFreeStmt(stmt_, SQL_UNBIND);
     SQLCloseCursor(stmt_);
 }

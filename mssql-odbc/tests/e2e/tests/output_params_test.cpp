@@ -92,6 +92,24 @@ TEST_F(OutputParamsTest, ResetBindingsDiscardsPendingWrites) {
     EXPECT_EQ(-1, length);
 }
 
+TEST_F(OutputParamsTest, NonAsciiCharacterOutputUsesNativeClientEncoding) {
+    ExecDirect("CREATE PROCEDURE #native_output @v nvarchar(16) OUTPUT AS "
+               "SET NOCOUNT ON; SET @v=NCHAR(233)+NCHAR(8364)+NCHAR(241)");
+    const auto expected = ODBCTestUtils::Utf8ToNativeClient("\xC3\xA9\xE2\x82\xAC\xC3\xB1");
+    std::array<SQLCHAR, 64> output;
+    output.fill(0xCC);
+    SQLLEN length = -99;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR,
+                                  SQL_WVARCHAR, 16, 0, output.data(),
+                                  output.size(), &length),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(SQL_NO_DATA, Exhaust(Direct("{call #native_output(?)}")));
+    ASSERT_EQ(static_cast<SQLLEN>(expected.size()), length);
+    EXPECT_EQ(expected, std::string(reinterpret_cast<const char*>(output.data()), expected.size()));
+    EXPECT_EQ(0, output[expected.size()]);
+    EXPECT_EQ(0xCC, output[expected.size() + 1]);
+}
+
 TEST_F(OutputParamsTest, RebindingRedirectsPendingWrites) {
     ExecDirect("CREATE PROCEDURE #outputs @v int OUTPUT AS "
                "SET NOCOUNT ON; SELECT 1; SET @v=73");
@@ -134,6 +152,32 @@ TEST_F(OutputParamsTest, CurrentBindOffsetDisplacesAllDescriptorPointers) {
     EXPECT_EQ(-1, lengths[0]);
     EXPECT_EQ(0, indicators[1]);
     EXPECT_EQ(sizeof(SQLINTEGER), lengths[1]);
+}
+
+// AB#49060: outputs are written after the result sets, so the APD offset
+// pointer in force then (not at execute) decides where they land.
+TEST_F(OutputParamsTest, WriteBackFollowsAnApdOffsetPointerRepointedAfterExecute) {
+    ExecDirect("CREATE PROCEDURE #outputs @v int OUTPUT AS "
+               "SET NOCOUNT ON; SELECT 1; SET @v=73");
+    std::array<SQLINTEGER, 4> values = {-1, -1, -1, -1};
+    std::array<SQLLEN, 2> indicators = {-1, -1};
+    SQLLEN none = 0;
+    SQLLEN one_slot = sizeof(SQLLEN);
+    BindInt(1, values[0], indicators[0]);
+    SQLHDESC apd = SQL_NULL_HDESC;
+    ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_APP_PARAM_DESC, &apd, 0, nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_OFFSET_PTR, &none, 0),
+                  SQL_HANDLE_DESC, apd);
+    ASSERT_SQL_OK(Direct("{call #outputs(?)}"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLSetDescField(apd, 0, SQL_DESC_BIND_OFFSET_PTR, &one_slot, 0),
+                  SQL_HANDLE_DESC, apd);
+    FetchOnlyRow();
+    EXPECT_EQ(SQL_NO_DATA, Exhaust());
+    EXPECT_EQ(-1, values[0]) << "the pointer in force at execute is not the one used";
+    EXPECT_EQ(73, values[sizeof(SQLLEN) / sizeof(SQLINTEGER)]);
+    EXPECT_EQ(-1, indicators[0]);
+    EXPECT_EQ(sizeof(SQLINTEGER), indicators[1]);
 }
 
 TEST_F(OutputParamsTest, OutputConversionErrorsReachTheApiReturnCode) {

@@ -155,12 +155,20 @@ fn sql_bind_parameter_safe(
     // locks. The STMT lock is dropped before those are taken — this crate
     // never holds a STMT lock while acquiring a DESC lock (see
     // bind_col.rs's identical rationale for SQLBindCol).
-    let (apd, c_type) = {
+    let (apd, c_type, param_focus) = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("SQLBindParameter: stmt mutex poisoned");
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+
+        // The current table-valued-parameter focus. When non-zero, this bind
+        // targets a constituent column of that TVP rather than a top-level
+        // parameter (see the routing after the validation block).
+        let param_focus = stmt_state
+            .vendor_attrs
+            .get(crate::api::odbc_types::SQL_SOPT_SS_PARAM_FOCUS)
+            .unwrap_or(0);
 
         // Fold the deprecated 2.x date/time C spellings onto the SQL_C_TYPE_*
         // forms so only one form per type reaches validation, conversion, and
@@ -233,25 +241,43 @@ fn sql_bind_parameter_safe(
             value_type
         };
 
-        // The C type -> SQL type conversion must be one this driver implements.
-        if !is_supported_conversion(c_type, parameter_type) {
-            error!(
-                c_type,
-                parameter_type, "SQLBindParameter: unsupported C/SQL type conversion"
-            );
-            post_diag(&mut stmt_state, ERR_PARAM_CONVERSION_NOT_IMPLEMENTED);
-            return SQL_ERROR;
-        }
+        // A table-valued parameter is not a scalar conversion: its top-level
+        // ValueType must be SQL_C_BINARY (SQL_C_DEFAULT already resolved to it
+        // above), and its ColumnSize is the row capacity rather than a
+        // precision. Neither the scalar conversion matrix nor the scalar
+        // ColumnSize check applies - the table's rows are assembled from the
+        // columns bound under SQL_SOPT_SS_PARAM_FOCUS at execute, not from this
+        // buffer. Every other type goes through both checks.
+        if parameter_type == crate::api::odbc_types::SQL_SS_TABLE {
+            if c_type != crate::api::odbc_types::SQL_C_BINARY {
+                error!(
+                    c_type,
+                    "SQLBindParameter: a table-valued parameter requires SQL_C_BINARY or SQL_C_DEFAULT"
+                );
+                post_diag(&mut stmt_state, ERR_PARAM_CONVERSION_NOT_IMPLEMENTED);
+                return SQL_ERROR;
+            }
+        } else {
+            // The C type -> SQL type conversion must be one this driver implements.
+            if !is_supported_conversion(c_type, parameter_type) {
+                error!(
+                    c_type,
+                    parameter_type, "SQLBindParameter: unsupported C/SQL type conversion"
+                );
+                post_diag(&mut stmt_state, ERR_PARAM_CONVERSION_NOT_IMPLEMENTED);
+                return SQL_ERROR;
+            }
 
-        // ColumnSize is validated last, after the type and conversion checks, the
-        // order msodbcsql's SQLBindParameter uses before CheckSqlPrecScale.
-        if !parameter_column_size_is_valid(parameter_type, column_size) {
-            error!(
-                parameter_type,
-                column_size, "SQLBindParameter: invalid ColumnSize for the SQL type"
-            );
-            post_diag(&mut stmt_state, ERR_INVALID_PARAM_PRECISION_OR_SCALE);
-            return SQL_ERROR;
+            // ColumnSize is validated last, after the type and conversion checks, the
+            // order msodbcsql's SQLBindParameter uses before CheckSqlPrecScale.
+            if !parameter_column_size_is_valid(parameter_type, column_size) {
+                error!(
+                    parameter_type,
+                    column_size, "SQLBindParameter: invalid ColumnSize for the SQL type"
+                );
+                post_diag(&mut stmt_state, ERR_INVALID_PARAM_PRECISION_OR_SCALE);
+                return SQL_ERROR;
+            }
         }
 
         // Output values are only ever produced by a procedure call, so a
@@ -283,10 +309,36 @@ fn sql_bind_parameter_safe(
             }
         }
 
+        // A table-valued parameter is input-only, and cannot nest inside
+        // another TVP. msodbcsql's SQLBindParameter rejects a non-input
+        // direction for SQL_SS_TABLE with HY105 (IDS_S1_105), and a TVP bound
+        // while focus is set (which would make it a column of another TVP) with
+        // HY004 (IDS_S1_004) - both up front, rather than deferring to execute.
+        if parameter_type == crate::api::odbc_types::SQL_SS_TABLE {
+            if param_focus != 0 {
+                error!("SQLBindParameter: table-valued parameters cannot be nested");
+                post_diag(&mut stmt_state, ERR_INVALID_SQL_DATA_TYPE);
+                return SQL_ERROR;
+            }
+            if input_output_type != SQL_PARAM_INPUT {
+                error!(
+                    input_output_type,
+                    "SQLBindParameter: a table-valued parameter must be input-only"
+                );
+                post_diag(&mut stmt_state, ERR_INVALID_PARAMETER_TYPE);
+                return SQL_ERROR;
+            }
+            // Re-declaring a TVP at this ordinal supersedes any columns captured
+            // for a previous one, so drop them before new columns are focused in.
+            stmt_state
+                .tvp_column_bindings
+                .remove(&usize::from(parameter_number));
+        }
+
         // SQLBindParameter/SetIPDRec in sqlcdesc.cpp retain indicator-only
         // output bindings; GetReturnValue treats a null destination as size 0.
 
-        (stmt_state.effective_apd(stmt), c_type)
+        (stmt_state.effective_apd(stmt), c_type, param_focus)
     };
 
     let bound = BoundParam {
@@ -307,6 +359,35 @@ fn sql_bind_parameter_safe(
         // SQLSetDescFieldW/SQLSetDescRec.
         octet_length_ptr: strlen_or_ind_ptr,
     };
+
+    // A bind issued while SQL_SOPT_SS_PARAM_FOCUS is set is a constituent
+    // column of that TVP, not a top-level parameter: capture it under the TVP's
+    // ordinal (indexed by column ordinal) instead of writing the top-level
+    // APD/IPD, mirroring msodbcsql routing the bind to the TVP's child
+    // descriptor. The column's own type was validated above like any scalar.
+    if param_focus != 0 {
+        let tvp_ordinal = param_focus;
+        let column_index = usize::from(parameter_number) - 1;
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLBindParameter: stmt mutex poisoned storing TVP column");
+            return SQL_ERROR;
+        };
+        let columns = stmt_state
+            .tvp_column_bindings
+            .entry(tvp_ordinal)
+            .or_default();
+        if column_index >= columns.len() {
+            columns.resize(column_index + 1, None);
+        }
+        columns[column_index] = Some(bound);
+        debug!(
+            tvp_ordinal,
+            column = parameter_number,
+            "SQLBindParameter: TVP column bound under focus"
+        );
+        return SQL_SUCCESS;
+    }
+
     let Ok(definition_changed) = bind_param_records(apd, stmt.ipd, parameter_number, bound) else {
         error!("SQLBindParameter: failed writing to apd/ipd (poisoned mutex or missing record)");
         if let Ok(mut stmt_state) = stmt.inner.lock() {
@@ -440,6 +521,9 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
             return SQL_ERROR;
         };
         free_errors(&mut stmt_state);
+        // The TVP column captures are part of the parameter bindings this
+        // option resets.
+        stmt_state.tvp_column_bindings.clear();
         stmt_state.effective_apd(stmt)
     };
 
@@ -495,8 +579,8 @@ fn sql_free_stmt_reset_params_safe(stmt: &StmtHandle) -> SqlReturn {
 mod tests {
     use super::*;
     use crate::api::odbc_types::{
-        SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA, SQL_NULL_HANDLE,
-        SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
+        SQL_C_BINARY, SQL_C_CHAR, SQL_C_SLONG, SQL_GUID, SQL_INTEGER, SQL_NULL_DATA,
+        SQL_NULL_HANDLE, SQL_PARAM_OUTPUT, SQL_SS_UDT, SQL_VARBINARY, SQL_VARCHAR,
     };
     use crate::handles::handle_from_raw;
     use crate::test_support::TestHandles;
@@ -881,10 +965,11 @@ mod tests {
     }
 
     #[test]
-    fn default_c_type_resolved_but_unconvertible_returns_hyc00() {
-        // `SQL_SS_TABLE` resolves to `SQL_C_BINARY` like a UDT does, but TVP
-        // binding is a separate feature with no row in the matrix, so a
-        // defaulted bind of it is still rejected up front.
+    fn tvp_binds_with_default_c_type_resolving_to_binary() {
+        // `SQL_SS_TABLE` resolves `SQL_C_DEFAULT` to `SQL_C_BINARY`, the only
+        // value type a TVP accepts. Binding it as an input parameter now
+        // succeeds (the top-level identity and rows are supplied through the
+        // IPD name fields and the focused columns, not this buffer).
         let h = TestHandles::with_env_dbc_stmt();
         let mut ind: SqlLen = 0;
         let ret = unsafe {
@@ -901,10 +986,159 @@ mod tests {
                 &mut ind,
             )
         };
+        assert_eq!(ret, SQL_SUCCESS);
+        let binding = bound_params(&h);
+        let bound = binding[0].as_ref().expect("parameter 1 should be bound");
+        assert_eq!(bound.param.c_type, SQL_C_BINARY);
+    }
+
+    /// A table-valued parameter is input-only; any other direction is rejected
+    /// at bind with HY105, matching msodbcsql's `SQLBindParameter`
+    /// (`IDS_S1_105`) rather than being deferred to execute.
+    #[test]
+    fn tvp_rejects_a_non_input_direction() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_OUTPUT,
+                SQL_C_BINARY,
+                crate::api::odbc_types::SQL_SS_TABLE,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
         assert_eq!(ret, SQL_ERROR);
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
-        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HYC00);
+        assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY105);
+    }
+
+    /// Helper: bind a scalar `SQL_C_SLONG` -> `SQL_INTEGER` column at
+    /// `ordinal`, returning the `SQLBindParameter` result.
+    fn bind_int_column(
+        h: &TestHandles,
+        ordinal: SqlUSmallInt,
+        value: &mut i32,
+        ind: &mut SqlLen,
+    ) -> SqlReturn {
+        unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                ordinal,
+                SQL_PARAM_INPUT,
+                SQL_C_SLONG,
+                SQL_INTEGER,
+                0,
+                0,
+                value as *mut i32 as SqlPointer,
+                0,
+                ind,
+            )
+        }
+    }
+
+    /// Helper: bind a TVP at `ordinal` and focus on it, directly setting the
+    /// focus to avoid the cross-module attribute call.
+    fn bind_and_focus_tvp(h: &TestHandles, ordinal: SqlUSmallInt) {
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                ordinal,
+                SQL_PARAM_INPUT,
+                SQL_C_BINARY,
+                crate::api::odbc_types::SQL_SS_TABLE,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS, "binding the TVP at {ordinal}");
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .vendor_attrs
+            .store_param_focus(SqlULen::from(ordinal));
+    }
+
+    /// While SQL_SOPT_SS_PARAM_FOCUS names a TVP, SQLBindParameter captures the
+    /// bind as one of that TVP's columns instead of writing the top-level
+    /// APD/IPD. The top-level records keep only the TVP itself.
+    #[test]
+    fn tvp_columns_are_captured_under_focus() {
+        let h = TestHandles::with_env_dbc_stmt();
+        bind_and_focus_tvp(&h, 1);
+
+        let (mut c0, mut c1) = (10i32, 20i32);
+        let (mut i0, mut i1) = (0 as SqlLen, 0 as SqlLen);
+        assert_eq!(bind_int_column(&h, 1, &mut c0, &mut i0), SQL_SUCCESS);
+        assert_eq!(bind_int_column(&h, 2, &mut c1, &mut i1), SQL_SUCCESS);
+
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let state = stmt.inner.lock().unwrap();
+        let columns = state
+            .tvp_column_bindings
+            .get(&1)
+            .expect("the TVP should have captured columns");
+        assert_eq!(columns.len(), 2);
+        assert!(columns[0].is_some() && columns[1].is_some());
+        // The focused column binds did not grow the top-level IPD past the TVP.
+        drop(state);
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        assert_eq!(ipd.inner.lock().unwrap().records.len(), 1);
+    }
+
+    /// A TVP cannot be a column of another TVP: binding SQL_SS_TABLE while focus
+    /// is set is HY004 (msodbcsql IDS_S1_004), not a captured column.
+    #[test]
+    fn tvp_cannot_nest_under_focus() {
+        let h = TestHandles::with_env_dbc_stmt();
+        bind_and_focus_tvp(&h, 1);
+
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                2,
+                SQL_PARAM_INPUT,
+                SQL_C_BINARY,
+                crate::api::odbc_types::SQL_SS_TABLE,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_ERROR);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert_eq!(
+            stmt.inner.lock().unwrap().diag_records[0].sql_state,
+            crate::api::sqlstate::SQLSTATE_HY004
+        );
+    }
+
+    /// SQLFreeStmt(SQL_RESET_PARAMS) drops captured TVP columns along with the
+    /// other parameter bindings.
+    #[test]
+    fn reset_params_clears_captured_tvp_columns() {
+        let h = TestHandles::with_env_dbc_stmt();
+        bind_and_focus_tvp(&h, 1);
+        let (mut c0, mut i0) = (1i32, 0 as SqlLen);
+        assert_eq!(bind_int_column(&h, 1, &mut c0, &mut i0), SQL_SUCCESS);
+
+        assert_eq!(unsafe { sql_free_stmt_reset_params(h.stmt) }, SQL_SUCCESS);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        assert!(stmt.inner.lock().unwrap().tvp_column_bindings.is_empty());
     }
 
     /// Binding a UDT with a scalar C type is illegal, not merely unbuilt:

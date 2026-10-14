@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -534,6 +534,14 @@ pub(crate) struct StmtState {
     /// Parameters bound via `SQLBindParameter`, indexed by `(ParameterNumber
     /// - 1)`. `None` slots are gaps left by binding a higher ordinal first.
     pub(crate) bound_params: Vec<Option<ParamSnapshot>>,
+    /// Constituent columns of each table-valued parameter, captured while that
+    /// parameter was the active `SQL_SOPT_SS_PARAM_FOCUS`. Keyed by the TVP's
+    /// 1-based ordinal; each value holds the TVP's columns indexed by
+    /// `(column ordinal - 1)`. `SQLBindParameter` under focus writes here
+    /// instead of the top-level APD/IPD, mirroring msodbcsql routing a bind to
+    /// the TVP's child descriptor. Read at execute to assemble the table's rows,
+    /// and cleared whenever the parameter bindings are reset.
+    pub(crate) tvp_column_bindings: BTreeMap<usize, Vec<Option<BoundParam>>>,
     /// The identity of a prepared statement superseded by a re-prepare / rebind
     /// / `SQLExecDirect`, whose server handle awaits release with `sp_unprepare`.
     /// The drop is deferred to the next point that already holds the TDS client
@@ -1311,6 +1319,17 @@ impl VendorStmtAttrs {
         Self::index_of(attribute).map(|i| self.0[i])
     }
 
+    /// Stores `SQL_SOPT_SS_PARAM_FOCUS` directly, bypassing the static value
+    /// rule. Its validity depends on the statement's bound parameters (a valid
+    /// table-valued-parameter ordinal, or 0 to restore top-level binding)
+    /// rather than a fixed range, so the caller validates against the IPD and
+    /// this writes the slot. The value still reads back through [`Self::get`].
+    pub(crate) fn store_param_focus(&mut self, value: SqlULen) {
+        if let Some(i) = Self::index_of(odbc_types::SQL_SOPT_SS_PARAM_FOCUS) {
+            self.0[i] = value;
+        }
+    }
+
     /// Validates `value` against the attribute's measured rule, storing it and
     /// returning `true` on success.
     ///
@@ -1634,6 +1653,7 @@ impl StmtHandle {
                 parameter_metadata: Vec::new(),
                 parameter_udt_names: Vec::new(),
                 bound_params: Vec::new(),
+                tvp_column_bindings: BTreeMap::new(),
                 pending_unprepare: None,
                 parameter_array: None,
                 row_positioned: false,

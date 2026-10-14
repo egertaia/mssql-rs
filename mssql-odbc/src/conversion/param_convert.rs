@@ -26,6 +26,7 @@ use mssql_tds::datatypes::column_values::{
 };
 use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::sql_string::{EncodingType, SqlString, encode_narrow};
+use mssql_tds::datatypes::sql_tvp::{TvpColumnDef, TvpTableData, TvpTypeName};
 use mssql_tds::datatypes::sql_udt::UdtTypeName;
 use mssql_tds::datatypes::sqldatatypes::VectorBaseType;
 use mssql_tds::datatypes::sqltypes::SqlType;
@@ -36,13 +37,14 @@ use mssql_tds::token::tokens::SqlCollation;
 use uuid::Uuid;
 
 use crate::api::odbc_types::{
-    SQL_BIGINT, SQL_BINARY, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_NUMERIC, SQL_C_WCHAR,
-    SQL_CHAR, SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID, SQL_INTEGER,
-    SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NULL_DATA, SQL_NUMERIC,
-    SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT, SQL_SS_VARIANT,
-    SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT, SQL_TYPE_DATE,
-    SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR, SQL_WLONGVARCHAR,
-    SQL_WVARCHAR, SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt, SqlSsVectorLayout,
+    SQL_BIGINT, SQL_BINARY, SQL_BIND_BY_COLUMN, SQL_BIT, SQL_C_BINARY, SQL_C_CHAR, SQL_C_NUMERIC,
+    SQL_C_WCHAR, SQL_CHAR, SQL_DATA_AT_EXEC, SQL_DECIMAL, SQL_DOUBLE, SQL_FLOAT, SQL_GUID,
+    SQL_INTEGER, SQL_LEN_DATA_AT_EXEC_OFFSET, SQL_LONGVARBINARY, SQL_LONGVARCHAR, SQL_NULL_DATA,
+    SQL_NUMERIC, SQL_REAL, SQL_SMALLINT, SQL_SS_TIME2, SQL_SS_TIMESTAMPOFFSET, SQL_SS_UDT,
+    SQL_SS_VARIANT, SQL_SS_VECTOR, SQL_SS_VECTOR_ELEMENT_SIZE, SQL_SS_XML, SQL_TINYINT,
+    SQL_TYPE_DATE, SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, SQL_VARBINARY, SQL_VARCHAR, SQL_WCHAR,
+    SQL_WLONGVARCHAR, SQL_WVARCHAR, SqlGuid, SqlLen, SqlNumericStruct, SqlSmallInt,
+    SqlSsVectorLayout,
 };
 use crate::api::sqlstate::{
     DiagMsg, ERR_DATA_AT_EXEC_NOT_STAGED, ERR_DATETIME_FIELD_OVERFLOW, ERR_INTERNAL_CONVERSION,
@@ -51,7 +53,7 @@ use crate::api::sqlstate::{
     ERR_INVALID_USE_OF_DEFAULT_PARAM, ERR_MEMORY_ALLOCATION, ERR_MISSING_UDT_TYPE_NAME,
     ERR_NUMERIC_OUT_OF_RANGE, ERR_PARAM_C_TYPE_NOT_IMPLEMENTED,
     ERR_PARAM_CONVERSION_NOT_IMPLEMENTED, ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
-    ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE,
+    ERR_PARAM_STRING_TRUNCATION, ERR_RESTRICTED_DATA_TYPE, ERR_UNBOUND_PARAMETER,
 };
 use crate::api::type_rules::{
     SQL_PREC_BIGCHARBINARY, SQL_PREC_NCHAR, SQL_PREC_NTEXT, SQL_PREC_NUMERIC, SQL_PREC_TEXTIMAGE,
@@ -68,7 +70,7 @@ use crate::conversion::numeric::{
 };
 use crate::conversion::param_buffer::{AppValue, Indicator, read_indicator, read_param_value};
 use crate::handles::desc::UdtNames;
-use crate::params::BoundParam;
+use crate::params::{BoundParam, ParamArrayLayoutError};
 
 /// Why a bound parameter could not be turned into an RPC parameter.
 ///
@@ -121,6 +123,12 @@ pub(crate) enum ParamBuildError {
     /// A `SQL_SS_UDT` parameter with no `SQL_CA_SS_UDT_TYPE_NAME` on its IPD
     /// record. The server cannot resolve the type without it.
     MissingUdtTypeName,
+    /// A `SQL_SS_TABLE` parameter with no table type name on its IPD record.
+    /// The server cannot resolve the table type without it.
+    MissingTableTypeName,
+    /// A table-valued parameter has rows but one of its constituent columns
+    /// (0-based index) was never bound under `SQL_SOPT_SS_PARAM_FOCUS`.
+    TvpColumnUnbound(usize),
     /// The value could not be represented in the target SQL type.
     Value(ConvError),
 }
@@ -144,6 +152,8 @@ impl ParamBuildError {
             Self::UnsupportedSqlType(_) => ERR_PARAM_SQL_TYPE_NOT_IMPLEMENTED,
             Self::ConversionNotImplemented => ERR_PARAM_CONVERSION_NOT_IMPLEMENTED,
             Self::MissingUdtTypeName => ERR_MISSING_UDT_TYPE_NAME,
+            Self::MissingTableTypeName => ERR_MISSING_UDT_TYPE_NAME,
+            Self::TvpColumnUnbound(_) => ERR_UNBOUND_PARAMETER,
             Self::Value(ConvError::OutOfRange) => ERR_NUMERIC_OUT_OF_RANGE,
             // Exhaustiveness backstop; parameters use Self::DateTimeFieldOverflow.
             Self::Value(ConvError::DatetimeFieldOverflow) => ERR_DATETIME_FIELD_OVERFLOW,
@@ -2105,6 +2115,126 @@ fn udt_type_name(names: Option<&UdtNames>) -> Result<UdtTypeName, ParamBuildErro
     ))
 }
 
+/// Builds the RPC parameter for a table-valued parameter.
+///
+/// The top-level binding supplies the three-part type name (from the IPD's
+/// `SQL_CA_SS_*` name fields, threaded here as `udt_names`) and the row count
+/// (its indicator: a non-negative count, or `SQL_DEFAULT_PARAM`/absent for an
+/// empty table). Each constituent column — captured while the TVP was the
+/// parameter focus — supplies one `SqlType` per row through the same scalar
+/// conversion a top-level parameter uses, so a TVP cell behaves exactly like
+/// the equivalent scalar.
+///
+/// # Safety
+/// `tvp` and every column in `columns` must satisfy the `SQLBindParameter`
+/// contract for the duration of this call; their value and indicator buffers
+/// are read here. `bind_offset` is the execution's `SQL_ATTR_PARAM_BIND_OFFSET`.
+pub(crate) unsafe fn build_tvp_param(
+    name: Option<String>,
+    tvp: &BoundParam,
+    udt_names: Option<&UdtNames>,
+    columns: &[Option<BoundParam>],
+    bind_offset: isize,
+) -> Result<RpcParameter, ParamBuildError> {
+    let type_name = tvp_type_name(udt_names)?;
+
+    // The indicator carries the row count; a negative value (SQL_DEFAULT_PARAM)
+    // or a null pointer means an empty table, which the wire encodes as a
+    // no-metadata TVP.
+    let row_count = unsafe { tvp_row_count(tvp, bind_offset) };
+    let Some(row_count) = row_count.filter(|&n| n > 0) else {
+        return Ok(RpcParameter::new(
+            name,
+            StatusFlags::DEFAULT_VALUE,
+            SqlType::Table(type_name, None),
+        ));
+    };
+
+    // Column templates (type only), with precision/scale for the types whose
+    // metadata lives inside the value.
+    let mut column_defs = Vec::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        let column = column
+            .as_ref()
+            .ok_or(ParamBuildError::TvpColumnUnbound(index))?;
+        column_defs.push(tvp_column_def(column)?);
+    }
+
+    // Rows, built column-major from the captured column arrays and transposed.
+    let mut rows = Vec::with_capacity(row_count);
+    for row in 0..row_count {
+        let mut cells = Vec::with_capacity(columns.len());
+        for (index, column) in columns.iter().enumerate() {
+            let column = column
+                .as_ref()
+                .ok_or(ParamBuildError::TvpColumnUnbound(index))?;
+            let positioned = column.for_row(row, 0, SQL_BIND_BY_COLUMN).map_err(
+                |ParamArrayLayoutError::InvalidValueStride { .. }| {
+                    ParamBuildError::InvalidBufferLength
+                },
+            )?;
+            let ((value, _), _) = unsafe { bound_param_to_value_with_outcome(&positioned, None) }?;
+            cells.push(value);
+        }
+        rows.push(cells);
+    }
+
+    Ok(RpcParameter::new(
+        name,
+        StatusFlags::NONE,
+        SqlType::Table(type_name, Some(TvpTableData::new(column_defs, rows))),
+    ))
+}
+
+/// The three-part table type name for a TVP, from its IPD name fields. The
+/// type name is required; the schema is optional (the server resolves an
+/// unqualified name against the default schema), and the catalog is omitted —
+/// SQL Server forbids a cross-database TVP type.
+fn tvp_type_name(names: Option<&UdtNames>) -> Result<TvpTypeName, ParamBuildError> {
+    let names = names.filter(|n| !n.type_name.is_empty());
+    let Some(names) = names else {
+        return Err(ParamBuildError::MissingTableTypeName);
+    };
+    Ok(TvpTypeName::new(
+        Some(names.schema.clone()).filter(|s| !s.is_empty()),
+        names.type_name.clone(),
+    ))
+}
+
+/// A column definition from a captured column binding: its type template plus
+/// precision/scale for the types whose wire metadata is not carried by a
+/// `None`-valued template (`Decimal`/`Numeric`/`Time`/`DateTime2`/
+/// `DateTimeOffset`).
+fn tvp_column_def(column: &BoundParam) -> Result<TvpColumnDef, ParamBuildError> {
+    let (template, metadata) = typed_null(
+        column.sql_type,
+        column.column_size,
+        column.decimal_digits,
+        None,
+    )?;
+    let mut def = TvpColumnDef::new(template);
+    if let Some(metadata) = metadata {
+        def.precision = metadata.precision;
+        def.scale = metadata.scale;
+    }
+    Ok(def)
+}
+
+/// The row count a TVP's indicator declares, or `None` for an empty table
+/// (`SQL_DEFAULT_PARAM`, a negative value, or a null indicator pointer).
+///
+/// # Safety
+/// `tvp`'s indicator pointer, after `bind_offset`, must be null or address a
+/// readable `SqlLen`.
+unsafe fn tvp_row_count(tvp: &BoundParam, bind_offset: isize) -> Option<usize> {
+    let positioned = tvp.with_bind_offset(bind_offset);
+    if positioned.strlen_or_ind_ptr.is_null() {
+        return None;
+    }
+    let indicator = unsafe { positioned.strlen_or_ind_ptr.read_unaligned() };
+    usize::try_from(indicator).ok()
+}
+
 /// Recovers a vector's dimension count and base type from the `ColumnSize` and
 /// `DecimalDigits` that `SQLDescribeParam` reported.
 ///
@@ -4017,6 +4147,102 @@ mod tests {
                 "sql_type {sql_type} fell back to varchar(max)"
             );
         }
+    }
+
+    /// `tvp_type_name` keeps the schema and type but drops the catalog (SQL
+    /// Server forbids a cross-database TVP type), and an unqualified name
+    /// leaves the schema unset for the server to resolve.
+    #[test]
+    fn tvp_type_name_keeps_schema_and_type_but_drops_catalog() {
+        use crate::handles::desc::UdtNames;
+        let names = UdtNames {
+            catalog: "mydb".into(),
+            schema: "sales".into(),
+            type_name: "OrderList".into(),
+            assembly_type_name: String::new(),
+        };
+        let name = tvp_type_name(Some(&names)).unwrap();
+        assert_eq!(name.type_name, "OrderList");
+        assert_eq!(name.schema_name.as_deref(), Some("sales"));
+        assert_eq!(name.db_name, None);
+
+        let unqualified = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+        let name = tvp_type_name(Some(&unqualified)).unwrap();
+        assert_eq!(name.schema_name, None);
+    }
+
+    /// A TVP with no type name cannot be resolved by the server.
+    #[test]
+    fn tvp_type_name_requires_a_name() {
+        assert!(matches!(
+            tvp_type_name(None),
+            Err(ParamBuildError::MissingTableTypeName)
+        ));
+    }
+
+    /// The TVP indicator carries the row count; `SQL_DEFAULT_PARAM`, a negative
+    /// value, or a null pointer all mean an empty table.
+    #[test]
+    fn tvp_row_count_reads_the_indicator() {
+        let mut count: SqlLen = 3;
+        let p = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
+        assert_eq!(unsafe { tvp_row_count(&p, 0) }, Some(3));
+
+        let mut default: SqlLen = SQL_DEFAULT_PARAM;
+        let p = param(SQL_C_BINARY, std::ptr::null_mut(), &mut default);
+        assert_eq!(unsafe { tvp_row_count(&p, 0) }, None);
+
+        let p = param(SQL_C_BINARY, std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(unsafe { tvp_row_count(&p, 0) }, None);
+    }
+
+    /// An empty TVP builds without reading any column, carries no rows, and
+    /// still needs its type name.
+    #[test]
+    fn build_tvp_param_handles_an_empty_table() {
+        use crate::handles::desc::UdtNames;
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+        let mut default: SqlLen = SQL_DEFAULT_PARAM;
+        let tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut default);
+        assert!(unsafe { build_tvp_param(None, &tvp, Some(&names), &[], 0) }.is_ok());
+
+        let err = unsafe { build_tvp_param(None, &tvp, None, &[], 0) }.unwrap_err();
+        assert!(matches!(err, ParamBuildError::MissingTableTypeName));
+    }
+
+    /// A non-empty TVP assembles one SqlType per row from each column's array
+    /// buffer; an unbound column is rejected.
+    #[test]
+    fn build_tvp_param_assembles_rows_and_rejects_unbound_columns() {
+        use crate::handles::desc::UdtNames;
+        let names = UdtNames {
+            type_name: "OrderList".into(),
+            ..Default::default()
+        };
+
+        let mut col_values: [i32; 2] = [10, 20];
+        let mut col_indicators: [SqlLen; 2] = [0, 0];
+        let column = int_param(
+            SQL_C_SLONG,
+            SQL_INTEGER,
+            col_values.as_mut_ptr() as *mut c_void,
+            col_indicators.as_mut_ptr(),
+        );
+        let columns = vec![Some(column)];
+
+        let mut count: SqlLen = 2;
+        let tvp = param(SQL_C_BINARY, std::ptr::null_mut(), &mut count);
+        assert!(unsafe { build_tvp_param(None, &tvp, Some(&names), &columns, 0) }.is_ok());
+
+        let unbound = vec![None];
+        let err = unsafe { build_tvp_param(None, &tvp, Some(&names), &unbound, 0) }.unwrap_err();
+        assert!(matches!(err, ParamBuildError::TvpColumnUnbound(0)));
     }
 
     /// One buffer, four declarations: the wire type follows `ParameterType`, so

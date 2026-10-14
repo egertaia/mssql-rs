@@ -858,6 +858,8 @@ pub(super) unsafe fn build_positional_params(
     let built = unsafe {
         build_named_params_for_row(
             bound,
+            &stmt_state.tvp_column_bindings,
+            skip + 1,
             marker_count.saturating_sub(skip),
             bind_offset,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
@@ -907,6 +909,8 @@ pub(super) unsafe fn build_named_params(
     match unsafe {
         build_named_params_for_row(
             &stmt_state.bound_params,
+            &stmt_state.tvp_column_bindings,
+            1,
             marker_count,
             bind_offset,
             crate::api::odbc_types::SQL_BIND_BY_COLUMN,
@@ -932,8 +936,11 @@ pub(super) unsafe fn build_named_params(
 /// # Safety
 /// Every pointer in `bound_params`, after applying `bind_offset` and the
 /// row-specific stride, must satisfy the original `SQLBindParameter` contract.
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn build_named_params_for_row(
     bound_params: &[Option<ParamSnapshot>],
+    tvp_columns: &std::collections::BTreeMap<usize, Vec<Option<crate::params::BoundParam>>>,
+    first_ordinal: usize,
     marker_count: usize,
     bind_offset: isize,
     param_bind_type: crate::api::odbc_types::SqlULen,
@@ -949,6 +956,32 @@ pub(super) unsafe fn build_named_params_for_row(
         let Some(Some(snapshot)) = bound_params.get(i) else {
             return Err(ParamRowBuildError::Unbound { parameter: i + 1 });
         };
+        let name = named.then(|| parameter_name(i));
+
+        // A table-valued parameter is assembled from the columns captured
+        // while it was the parameter focus, not converted from a scalar
+        // buffer. Its row set is one logical value, so it is unaffected by the
+        // parameter-array row iteration (`row`).
+        if snapshot.param.sql_type == crate::api::odbc_types::SQL_SS_TABLE {
+            let ordinal = first_ordinal + i;
+            let columns = tvp_columns.get(&ordinal).map_or(&[][..], Vec::as_slice);
+            let rpc = unsafe {
+                crate::conversion::param_convert::build_tvp_param(
+                    name,
+                    &snapshot.param,
+                    snapshot.udt_names.as_deref(),
+                    columns,
+                    bind_offset,
+                )
+            }
+            .map_err(|source| ParamRowBuildError::Conversion {
+                parameter: i + 1,
+                source,
+            })?;
+            params.push(rpc);
+            continue;
+        }
+
         let udt_names = snapshot.udt_names.as_deref();
         let bound_param = snapshot
             .param
@@ -956,7 +989,6 @@ pub(super) unsafe fn build_named_params_for_row(
             .map_err(|ParamArrayLayoutError::InvalidValueStride { .. }| {
                 ParamRowBuildError::Layout { parameter: i + 1 }
             })?;
-        let name = named.then(|| parameter_name(i));
         let dae_indicator =
             unsafe { crate::conversion::param_convert::data_at_exec_indicator(&bound_param) };
 

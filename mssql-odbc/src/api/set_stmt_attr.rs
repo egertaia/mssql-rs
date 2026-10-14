@@ -64,9 +64,9 @@ use crate::api::odbc_types::{
     SQL_ATTR_ROWS_FETCHED_PTR, SQL_ATTR_SIMULATE_CURSOR, SQL_CONCUR_READ_ONLY,
     SQL_CURSOR_FORWARD_ONLY, SQL_ERROR, SQL_FALSE, SQL_INSENSITIVE, SQL_INVALID_HANDLE,
     SQL_NONSCROLLABLE, SQL_NTS, SQL_ROWSET_SIZE, SQL_SC_UNIQUE, SQL_SOPT_SS_CURRENT_COMMAND,
-    SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT, SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SUCCESS,
-    SQL_SUCCESS_WITH_INFO, SQL_TRUE, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlULen,
-    SqlWChar,
+    SQL_SOPT_SS_PARAM_FOCUS, SQL_SOPT_SS_QUERYNOTIFICATION_MSGTEXT,
+    SQL_SOPT_SS_QUERYNOTIFICATION_OPTIONS, SQL_SS_TABLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO,
+    SQL_TRUE, SqlHandle, SqlInteger, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlWChar,
 };
 use crate::api::set_desc_field::clamp_array_size;
 use crate::api::sqlstate::{
@@ -175,6 +175,31 @@ unsafe fn sql_set_stmt_attr_w_impl(
         "SQLSetStmtAttrW: handle is not a STMT"
     );
     unsafe { sql_set_stmt_attr_w_safe(stmt, attribute, value_ptr, string_length) }
+}
+
+/// Whether `ordinal` (1-based) names a parameter currently bound as a
+/// table-valued parameter (`SQL_SS_TABLE`) on `stmt`'s IPD.
+///
+/// Mirrors msodbcsql's `IsValidTvpOrdinal` (`sqlcdesc.cpp`): a zero ordinal is
+/// never valid (it is the non-specific focus), and the record must exist and
+/// carry the table type. Reads the IPD without holding the STMT lock, per the
+/// crate's locking rule; a poisoned IPD mutex reads as "not valid" rather than
+/// panicking. `stmt.ipd` is never reassociated or independently freed
+/// (`SQL_ATTR_IMP_PARAM_DESC` is read-only), so no liveness recheck is needed.
+fn is_valid_tvp_ordinal(stmt: &StmtHandle, ordinal: SqlULen) -> bool {
+    if ordinal == 0 {
+        return false;
+    }
+    let Ok(record_number) = SqlSmallInt::try_from(ordinal) else {
+        return false;
+    };
+    let ipd = unsafe { handle_from_raw::<DescHandle>(stmt.ipd) };
+    let Ok(ipd_state) = ipd.inner.lock() else {
+        return false;
+    };
+    ipd_state
+        .record(record_number)
+        .is_some_and(|record| record.concise_type == SQL_SS_TABLE)
 }
 
 /// # Safety
@@ -523,6 +548,40 @@ unsafe fn sql_set_stmt_attr_w_safe(
                 state.qn_options = value;
             }
             SQL_SUCCESS
+        }
+        // Table-valued-parameter focus. Validity depends on the statement's
+        // bound parameters, not a static rule: 0 restores top-level binding,
+        // and a non-zero value must name a parameter already bound as
+        // SQL_SS_TABLE (msodbcsql's IsValidTvpOrdinal). While focus is set,
+        // SQLBindParameter targets that TVP's constituent columns. Validated
+        // and stored here; the execute path enforces that it is 0 at execute
+        // time (HY024).
+        SQL_SOPT_SS_PARAM_FOCUS => {
+            let focus = value_ptr as SqlULen;
+            if focus != 0 {
+                // Read the IPD after releasing the STMT lock (locking rule).
+                drop(state);
+                let valid = is_valid_tvp_ordinal(stmt, focus);
+                let Ok(mut state) = stmt.inner.lock() else {
+                    error!("SQLSetStmtAttrW: stmt mutex poisoned validating PARAM_FOCUS");
+                    return SQL_ERROR;
+                };
+                if !valid {
+                    error!(
+                        focus,
+                        "SQLSetStmtAttrW: SQL_SOPT_SS_PARAM_FOCUS does not name a bound table-valued parameter"
+                    );
+                    post_diag(&mut state, ERR_INVALID_ATTRIBUTE_VALUE);
+                    return SQL_ERROR;
+                }
+                state.vendor_attrs.store_param_focus(focus);
+                debug!(focus, "SQLSetStmtAttrW: SQL_SOPT_SS_PARAM_FOCUS set");
+                SQL_SUCCESS
+            } else {
+                state.vendor_attrs.store_param_focus(0);
+                debug!("SQLSetStmtAttrW: SQL_SOPT_SS_PARAM_FOCUS cleared");
+                SQL_SUCCESS
+            }
         }
         // SQL Server vendor attributes. Unlike the inert set these validate
         // before storing: the Driver Manager has no knowledge of ids 1225-1238
@@ -2888,22 +2947,78 @@ mod tests {
         }
     }
 
-    /// `SQL_SOPT_SS_PARAM_FOCUS` and `SQL_SOPT_SS_COLUMN_ENCRYPTION` name
-    /// features neither driver offers here, and msodbcsql refuses every value
-    /// for them — including the "off" value its own headers define, and
-    /// including `COLUMN_ENCRYPTION` on a connection opened with
-    /// `ColumnEncryption=Enabled`. They are recognized, so the answer is
-    /// `HY024` (bad value) rather than `HY092` (bad identifier).
+    /// `SQL_SOPT_SS_COLUMN_ENCRYPTION` names a feature this driver does not
+    /// offer, and msodbcsql refuses every value for it — including the "off"
+    /// value its own headers define, and including on a connection opened with
+    /// `ColumnEncryption=Enabled`. It is recognized, so the answer is `HY024`
+    /// (bad value) rather than `HY092` (bad identifier).
     #[test]
     fn vendor_unsupported_features_reject_every_value() {
-        for attribute in [SQL_SOPT_SS_PARAM_FOCUS, SQL_SOPT_SS_COLUMN_ENCRYPTION] {
-            for value in [0, 1, 2] {
-                let h = TestHandles::with_env_dbc_stmt();
-                let ret = unsafe { sql_set_stmt_attr_w(h.stmt, attribute, value as SqlPointer, 0) };
-                assert_eq!(ret, SQL_ERROR, "set {attribute} = {value}");
-                assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
-            }
+        for value in [0, 1, 2] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let ret = unsafe {
+                sql_set_stmt_attr_w(
+                    h.stmt,
+                    SQL_SOPT_SS_COLUMN_ENCRYPTION,
+                    value as SqlPointer,
+                    0,
+                )
+            };
+            assert_eq!(ret, SQL_ERROR, "set COLUMN_ENCRYPTION = {value}");
+            assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
         }
+    }
+
+    /// Setting `SQL_SOPT_SS_PARAM_FOCUS` to 0 always succeeds (it restores
+    /// top-level binding), and reads back as 0.
+    #[test]
+    fn param_focus_zero_is_accepted() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 0 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS);
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_PARAM_FOCUS), 0);
+    }
+
+    /// A non-zero focus that does not name a bound table-valued parameter is
+    /// rejected with HY024, and the stored focus stays 0.
+    #[test]
+    fn param_focus_rejects_an_ordinal_that_is_not_a_bound_tvp() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_ERROR);
+        assert_eq!(stmt_sql_state(h.stmt), SQLSTATE_HY024);
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_PARAM_FOCUS), 0);
+    }
+
+    /// Once a parameter is bound as `SQL_SS_TABLE`, focusing on its ordinal is
+    /// accepted and reads back.
+    #[test]
+    fn param_focus_accepts_a_bound_tvp_ordinal() {
+        use crate::api::odbc_types::{SQL_C_BINARY, SQL_PARAM_INPUT, SQL_SS_TABLE, SqlLen};
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            crate::api::bind_param::sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_BINARY,
+                SQL_SS_TABLE,
+                0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS, "binding the TVP");
+
+        let ret =
+            unsafe { sql_set_stmt_attr_w(h.stmt, SQL_SOPT_SS_PARAM_FOCUS, 1 as SqlPointer, 0) };
+        assert_eq!(ret, SQL_SUCCESS, "focusing on the bound TVP");
+        assert_eq!(get_attr(h.stmt, SQL_SOPT_SS_PARAM_FOCUS), 1);
     }
 
     /// A rejected value leaves the previous one in place — a failed set is not

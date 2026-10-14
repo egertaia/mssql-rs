@@ -9,6 +9,8 @@
 #include "odbc_test_fixture.h"
 
 #include <array>
+#include <cstring>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -75,9 +77,48 @@ protected:
         return ipd;
     }
 
+    // Binds the top-level TVP at `ordinal`: the type name in the value buffer,
+    // the schema through SQL_CA_SS_SCHEMA_NAME, and `rows` (or SQL_DEFAULT_PARAM)
+    // as the indicator. The type-name buffer is retained in `type_bufs_` so the
+    // pointer stays valid until execute.
+    void BindTvp(SQLUSMALLINT ordinal, const std::string& type_name, SQLLEN rows,
+                 const std::string& schema = "dbo") {
+        type_bufs_.push_back(std::wstring(type_name.begin(), type_name.end()));
+        std::wstring& tw = type_bufs_.back();
+        row_counts_.push_back(rows);
+        SQLLEN& ind = row_counts_.back();
+        ASSERT_SQL_OK(
+            SQLBindParameter(stmt_, ordinal, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE,
+                             rows == SQL_DEFAULT_PARAM ? 0 : static_cast<SQLULEN>(rows), 0,
+                             const_cast<SQLWCHAR*>(tw.c_str()),
+                             static_cast<SQLLEN>(tw.size() * sizeof(SQLWCHAR)), &ind),
+            SQL_HANDLE_STMT, stmt_);
+        schema_bufs_.push_back(std::wstring(schema.begin(), schema.end()));
+        std::wstring& sw = schema_bufs_.back();
+        ASSERT_SQL_OK(SQLSetDescFieldW(Ipd(), ordinal, SQL_CA_SS_SCHEMA_NAME,
+                                       const_cast<SQLWCHAR*>(sw.c_str()),
+                                       static_cast<SQLINTEGER>(sw.size() * sizeof(SQLWCHAR))),
+                      SQL_HANDLE_DESC, Ipd());
+    }
+
+    void Focus(SQLINTEGER ordinal) {
+        ASSERT_SQL_OK(SQLSetStmtAttr(stmt_, SQL_SOPT_SS_PARAM_FOCUS,
+                                     reinterpret_cast<SQLPOINTER>(
+                                         static_cast<SQLLEN>(ordinal)),
+                                     SQL_IS_INTEGER),
+                      SQL_HANDLE_STMT, stmt_);
+    }
+    void RestoreFocus() { Focus(0); }
+
     std::string suffix_;
     std::string type_name_;
     std::string proc_name_;
+    // Buffers retained for the lifetime of a bind so their pointers stay valid
+    // until execute. `deque`, not `vector`: binding a second TVP must not
+    // reallocate and invalidate the first TVP's retained name pointers.
+    std::deque<std::wstring> type_bufs_;
+    std::deque<std::wstring> schema_bufs_;
+    std::deque<SQLLEN> row_counts_;
 };
 
 // SQLDescribeParam reports the TVP as SQL_SS_TABLE and the IPD exposes the
@@ -200,4 +241,264 @@ TEST_F(TvpTest, EmptyTableYieldsNoRows) {
 
     ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
     EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+}
+
+// Rows with NULL and all-NULL cells round-trip; the column's declared type
+// still drives the wire metadata even when every value is NULL.
+TEST_F(TvpTest, NullAndAllNullCells) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 2);
+    Focus(1);
+
+    std::array<SQLINTEGER, 2> ids = {0, 0};         // values ignored for NULLs
+    std::array<SQLLEN, 2> id_ind = {SQL_NULL_DATA, SQL_NULL_DATA};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, ids.data(), 0, id_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+
+    const SQLULEN cap = 50;
+    std::vector<SQLWCHAR> labels((cap + 1) * 2, 0);
+    // Row 0 has a label, row 1 is NULL.
+    const std::wstring first = L"only";
+    for (size_t c = 0; c < first.size(); ++c) labels[c] = static_cast<SQLWCHAR>(first[c]);
+    std::array<SQLLEN, 2> label_ind = {
+        static_cast<SQLLEN>(first.size() * sizeof(SQLWCHAR)), SQL_NULL_DATA};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                                   cap, 0, labels.data(),
+                                   static_cast<SQLLEN>((cap + 1) * sizeof(SQLWCHAR)),
+                                   label_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    // Both id cells are NULL; label is "only" then NULL. Rows order by id, and
+    // NULL sorts first, so the first fetched row is the all-NULL-id pair.
+    int rows = 0;
+    SQLINTEGER id = 0;
+    SQLLEN id_len = 0;
+    SQLWCHAR label[64] = {0};
+    SQLLEN label_len = 0;
+    while (SQLFetch(stmt_) == SQL_SUCCESS) {
+        ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, &id_len), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_WCHAR, label, sizeof(label), &label_len),
+                      SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(id_len, SQL_NULL_DATA) << "both id cells were bound NULL";
+        ++rows;
+    }
+    EXPECT_EQ(rows, 2);
+}
+
+// Binding a TVP with any direction other than SQL_PARAM_INPUT is HY105.
+TEST_F(TvpTest, NonInputDirectionIsRejected) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    std::wstring type_w(type_name_.begin(), type_name_.end());
+    SQLLEN ind = 0;
+    EXPECT_EQ(
+        SQLBindParameter(stmt_, 1, SQL_PARAM_OUTPUT, SQL_C_BINARY, SQL_SS_TABLE, 0, 0,
+                         const_cast<SQLWCHAR*>(type_w.c_str()),
+                         static_cast<SQLLEN>(type_w.size() * sizeof(SQLWCHAR)), &ind),
+        SQL_ERROR);
+    EXPECT_EQ(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_), "HY105");
+}
+
+// A TVP cannot be a column of another TVP: binding SQL_SS_TABLE while focus is
+// set is HY004.
+TEST_F(TvpTest, NestedTvpIsRejected) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+    std::wstring type_w(type_name_.begin(), type_name_.end());
+    SQLLEN ind = 0;
+    EXPECT_EQ(
+        SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_SS_TABLE, 0, 0,
+                         const_cast<SQLWCHAR*>(type_w.c_str()),
+                         static_cast<SQLLEN>(type_w.size() * sizeof(SQLWCHAR)), &ind),
+        SQL_ERROR);
+    EXPECT_EQ(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_), "HY004");
+    RestoreFocus();
+}
+
+// Parameter focus must be reset to 0 before execute, else HY024.
+TEST_F(TvpTest, FocusMustBeZeroAtExecute) {
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc_name_ + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type_name_, 1);
+    Focus(1);
+    // Deliberately not restored.
+    EXPECT_EQ(SQLExecute(stmt_), SQL_ERROR);
+    EXPECT_EQ(ODBCTestUtils::GetDiagState(SQL_HANDLE_STMT, stmt_), "HY024");
+    RestoreFocus();
+}
+
+// A table type in a non-dbo schema round-trips when the schema is set through
+// SQL_CA_SS_SCHEMA_NAME.
+TEST_F(TvpTest, SchemaQualifiedType) {
+    const std::string schema = "pytvp_s_" + suffix_;
+    const std::string type = "qtype_" + suffix_;
+    const std::string proc = "qproc_" + suffix_;
+    Direct("DROP PROCEDURE IF EXISTS [" + schema + "].[" + proc + "]");
+    Direct("DROP TYPE IF EXISTS [" + schema + "].[" + type + "]");
+    Direct("DROP SCHEMA IF EXISTS [" + schema + "]");
+    ASSERT_SQL_OK(DirectRc("CREATE SCHEMA [" + schema + "]"), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        DirectRc("CREATE TYPE [" + schema + "].[" + type + "] AS TABLE (id INT)"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        DirectRc("CREATE PROCEDURE [" + schema + "].[" + proc + "] @t [" + schema + "].[" +
+                 type + "] READONLY AS SELECT id FROM @t ORDER BY id"),
+        SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(Prepare("EXEC [" + schema + "].[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type, 2, schema);
+    Focus(1);
+    std::array<SQLINTEGER, 2> ids = {7, 9};
+    std::array<SQLLEN, 2> id_ind = {0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                                   0, 0, ids.data(), 0, id_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    SQLINTEGER id = 0;
+    SQLLEN id_len = 0;
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, &id_len), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(id, 7);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &id, 0, &id_len), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(id, 9);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+
+    Direct("DROP PROCEDURE IF EXISTS [" + schema + "].[" + proc + "]");
+    Direct("DROP TYPE IF EXISTS [" + schema + "].[" + type + "]");
+    Direct("DROP SCHEMA IF EXISTS [" + schema + "]");
+}
+
+// A TVP with a mix of column types (bit, bigint, decimal, varbinary) round-trips
+// each value through the server.
+TEST_F(TvpTest, MixedColumnTypes) {
+    const std::string type = "mtype_" + suffix_;
+    const std::string proc = "mproc_" + suffix_;
+    Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc + "]");
+    Direct("DROP TYPE IF EXISTS dbo.[" + type + "]");
+    ASSERT_SQL_OK(
+        DirectRc("CREATE TYPE dbo.[" + type +
+                 "] AS TABLE (flag BIT, big BIGINT, amount DECIMAL(10,2), blob VARBINARY(16))"),
+        SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(
+        DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @t dbo.[" + type +
+                 "] READONLY AS SELECT flag, big, amount, blob FROM @t"),
+        SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?"), SQL_HANDLE_STMT, stmt_);
+    BindTvp(1, type, 1);
+    Focus(1);
+
+    unsigned char flag = 1;
+    SQLLEN flag_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_BIT, SQL_BIT, 0, 0,
+                                   &flag, 0, &flag_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    SQLBIGINT big = 9000000000LL;
+    SQLLEN big_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
+                                   &big, 0, &big_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    // Decimal carried as its character form (the driver resolves it on the wire).
+    std::string amount = "1234.56";
+    SQLLEN amount_ind = SQL_NTS;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 3, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_DECIMAL, 10, 2,
+                                   const_cast<char*>(amount.c_str()),
+                                   static_cast<SQLLEN>(amount.size() + 1), &amount_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    unsigned char blob[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+    SQLLEN blob_ind = sizeof(blob);
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 4, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 16, 0,
+                                   blob, sizeof(blob), &blob_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    unsigned char got_flag = 0;
+    SQLBIGINT got_big = 0;
+    unsigned char got_blob[8] = {0};
+    SQLLEN ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_BIT, &got_flag, 0, &ind), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLGetData(stmt_, 2, SQL_C_SBIGINT, &got_big, 0, &ind), SQL_HANDLE_STMT, stmt_);
+    SQLLEN blob_len = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 4, SQL_C_BINARY, got_blob, sizeof(got_blob), &blob_len),
+                  SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(got_flag, 1);
+    EXPECT_EQ(got_big, 9000000000LL);
+    ASSERT_EQ(blob_len, 4);
+    EXPECT_EQ(std::memcmp(got_blob, blob, 4), 0);
+    EXPECT_EQ(SQLFetch(stmt_), SQL_NO_DATA);
+
+    Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc + "]");
+    Direct("DROP TYPE IF EXISTS dbo.[" + type + "]");
+}
+
+// Two TVPs with a scalar parameter between them bind and execute together; each
+// TVP's columns are captured under its own focus.
+TEST_F(TvpTest, MultipleTvpsWithInterleavedScalar) {
+    const std::string proc = "m2proc_" + suffix_;
+    Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc + "]");
+    // Reuses the fixture's (id, label) type for both TVPs.
+    ASSERT_SQL_OK(
+        DirectRc("CREATE PROCEDURE dbo.[" + proc + "] @a dbo.[" + type_name_ +
+                 "] READONLY, @n INT, @b dbo.[" + type_name_ +
+                 "] READONLY AS SELECT COUNT(*) + @n AS c FROM (SELECT id FROM @a "
+                 "UNION ALL SELECT id FROM @b) u"),
+        SQL_HANDLE_STMT, stmt_);
+
+    ASSERT_SQL_OK(Prepare("EXEC dbo.[" + proc + "] ?, ?, ?"), SQL_HANDLE_STMT, stmt_);
+
+    BindTvp(1, type_name_, 2);
+    BindTvp(3, type_name_, 1);
+    SQLINTEGER n = 100;
+    SQLLEN n_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   &n, 0, &n_ind),
+                  SQL_HANDLE_STMT, stmt_);
+
+    // TVP @a: two rows.
+    Focus(1);
+    std::array<SQLINTEGER, 2> a_ids = {1, 2};
+    std::array<SQLLEN, 2> a_ind = {0, 0};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   a_ids.data(), 0, a_ind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    const SQLULEN cap = 50;
+    std::vector<SQLWCHAR> a_labels((cap + 1) * 2, 0);
+    std::array<SQLLEN, 2> a_lind = {SQL_NULL_DATA, SQL_NULL_DATA};
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, cap, 0,
+                                   a_labels.data(),
+                                   static_cast<SQLLEN>((cap + 1) * sizeof(SQLWCHAR)),
+                                   a_lind.data()),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+
+    // TVP @b: one row.
+    Focus(3);
+    SQLINTEGER b_id = 9;
+    SQLLEN b_ind = 0;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0,
+                                   &b_id, 0, &b_ind),
+                  SQL_HANDLE_STMT, stmt_);
+    std::vector<SQLWCHAR> b_labels(cap + 1, 0);
+    SQLLEN b_lind = SQL_NULL_DATA;
+    ASSERT_SQL_OK(SQLBindParameter(stmt_, 2, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR, cap, 0,
+                                   b_labels.data(),
+                                   static_cast<SQLLEN>((cap + 1) * sizeof(SQLWCHAR)), &b_lind),
+                  SQL_HANDLE_STMT, stmt_);
+    RestoreFocus();
+
+    ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+    SQLINTEGER total = 0;
+    SQLLEN total_ind = 0;
+    ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_SLONG, &total, 0, &total_ind), SQL_HANDLE_STMT, stmt_);
+    EXPECT_EQ(total, 103) << "2 rows + 1 row + @n(100)";
+
+    Direct("DROP PROCEDURE IF EXISTS dbo.[" + proc + "]");
 }

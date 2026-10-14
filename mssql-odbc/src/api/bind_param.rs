@@ -8,7 +8,7 @@ use tracing::{debug, error};
 
 use super::sqlstate::*;
 use crate::api::odbc_types::{
-    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT,
+    SQL_C_DEFAULT, SQL_ERROR, SQL_INVALID_HANDLE, SQL_NTS, SQL_PARAM_INPUT, SQL_PARAM_INPUT_OUTPUT,
     SQL_PARAM_INPUT_OUTPUT_STREAM, SQL_PARAM_OUTPUT, SQL_PARAM_OUTPUT_STREAM, SQL_RETURN_VALUE,
     SQL_SUCCESS, SqlHandle, SqlLen, SqlPointer, SqlReturn, SqlSmallInt, SqlULen, SqlUSmallInt,
 };
@@ -411,8 +411,76 @@ fn sql_bind_parameter_safe(
         return SQL_ERROR;
     }
 
+    // A top-level TVP's type name may be supplied in the value buffer, which
+    // maps to SQL_CA_SS_TYPE_NAME (the ODBC SQLBindParameter contract; msodbcsql
+    // reads it there). Record it on the IPD so execute can name the table type
+    // even without a prior SQLDescribeParam. Done after the bind, when the IPD
+    // record exists; a `None` here leaves any describe-supplied name in place.
+    if parameter_type == crate::api::odbc_types::SQL_SS_TABLE
+        && let Some(name) = unsafe { read_tvp_type_name(parameter_value_ptr, buffer_length) }
+    {
+        store_tvp_type_name(stmt.ipd, parameter_number, name);
+    }
+
     debug!(parameter_number, "SQLBindParameter: parameter bound");
     SQL_SUCCESS
+}
+
+/// Reads a table-valued-parameter type name from a `SQLBindParameter` value
+/// buffer: `buffer_length` bytes of UTF-16 when positive, or a NUL-terminated
+/// UTF-16 string when `SQL_NTS`. Returns `None` for a null pointer, a
+/// non-length, or an empty name.
+///
+/// # Safety
+/// `ptr` must be null or address a readable UTF-16 buffer of the indicated
+/// length (or NUL-terminated for `SQL_NTS`).
+unsafe fn read_tvp_type_name(ptr: SqlPointer, buffer_length: SqlLen) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let ptr = ptr as *const u16;
+    let units: Vec<u16> = if buffer_length > 0 {
+        let count = buffer_length as usize / size_of::<u16>();
+        unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec()
+    } else if SqlLen::from(SQL_NTS) == buffer_length {
+        let mut units = Vec::new();
+        let mut i = 0isize;
+        loop {
+            let unit = unsafe { *ptr.offset(i) };
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+            i += 1;
+        }
+        units
+    } else {
+        return None;
+    };
+    let name = String::from_utf16_lossy(&units);
+    let name = name.trim_end_matches('\0');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Records `name` as the table type name on `ipd`'s record, claiming it so a
+/// later `SQLDescribeParam` does not overwrite the application's choice (the
+/// same provenance the `SQL_CA_SS_*` descriptor-field writes use). Best-effort:
+/// a poisoned IPD mutex is logged rather than failing the bind, since the
+/// describe path can still supply the name.
+fn store_tvp_type_name(ipd: SqlHandle, record_number: SqlUSmallInt, name: String) {
+    let Ok(record_number) = SqlSmallInt::try_from(record_number) else {
+        return;
+    };
+    let desc = unsafe { handle_from_raw::<DescHandle>(ipd) };
+    let Ok(mut state) = desc.inner.lock() else {
+        error!("SQLBindParameter: ipd mutex poisoned storing TVP type name");
+        return;
+    };
+    if let Some(record) = state.record_mut(record_number) {
+        let names = std::sync::Arc::make_mut(record.udt_names.get_or_insert_with(Default::default));
+        names.type_name = name;
+        record.udt_name_claimed.type_name = true;
+    }
 }
 
 /// Writes `bound` into `apd`'s and `ipd`'s records at `parameter_number`,
@@ -1017,6 +1085,40 @@ mod tests {
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records[0].sql_state, SQLSTATE_HY105);
+    }
+
+    /// The table type name supplied in the value buffer is recorded on the IPD
+    /// (claimed), so execute can name the type without a prior SQLDescribeParam;
+    /// the ODBC SQLBindParameter contract maps `ParameterValuePtr` to
+    /// `SQL_CA_SS_TYPE_NAME`.
+    #[test]
+    fn tvp_bind_records_the_type_name_from_the_value_buffer() {
+        use crate::handles::desc::DescHandle;
+        let h = TestHandles::with_env_dbc_stmt();
+        let mut name: Vec<u16> = "OrderList".encode_utf16().collect();
+        let mut ind: SqlLen = 0;
+        let ret = unsafe {
+            sql_bind_parameter(
+                h.stmt,
+                1,
+                SQL_PARAM_INPUT,
+                SQL_C_BINARY,
+                crate::api::odbc_types::SQL_SS_TABLE,
+                0,
+                0,
+                name.as_mut_ptr() as SqlPointer,
+                (name.len() * 2) as SqlLen,
+                &mut ind,
+            )
+        };
+        assert_eq!(ret, SQL_SUCCESS);
+
+        let ipd = unsafe { handle_from_raw::<DescHandle>(h.ipd()) };
+        let state = ipd.inner.lock().unwrap();
+        let record = state.record(1).expect("ipd record 1");
+        let names = record.udt_names.as_ref().expect("type name recorded");
+        assert_eq!(names.type_name, "OrderList");
+        assert!(record.udt_name_claimed.type_name, "name is claimed");
     }
 
     /// Helper: bind a scalar `SQL_C_SLONG` -> `SQL_INTEGER` column at

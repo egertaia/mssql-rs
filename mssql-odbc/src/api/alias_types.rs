@@ -24,12 +24,14 @@
 //! be the session's principal.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use mssql_tds::connection::client_context::{ClientContext, TdsAuthenticationMethod};
 use mssql_tds::connection::tds_client::{ExecuteOptions, ResultSet, StatementResult, TdsClient};
 use mssql_tds::connection_provider::tds_connection_provider::TdsConnectionProvider;
 use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::column_values::ColumnValues;
+use mssql_tds::error::{Error as TdsError, TimeoutErrorType};
 use tracing::{debug, error};
 
 use super::txn::try_claim_idle_dbc_client;
@@ -144,10 +146,12 @@ fn refresh_alias_types(dbc: &DbcHandle) {
                 }
             }
         };
-        // The connection timeout bounds both reads. msodbcsql bounds its read
-        // on the session the same way (`GetNetIOTimeOut`) but leaves the
-        // spawned connection's unset, so a lookup blocked behind the session's
-        // own uncommitted type change could wait forever.
+        // The connection timeout bounds the whole lookup on either route,
+        // including the secondary login. msodbcsql bounds its read on the
+        // session the same way (`GetNetIOTimeOut`), but on a spawned
+        // connection it reads that connection's timeout, which is unset, so
+        // its lookup can wait forever behind the session's own uncommitted
+        // type change (parity-deviations entry 30).
         (state.session_generation, state.connection_timeout, route)
     };
 
@@ -238,15 +242,33 @@ fn prompts_for_sign_in(context: &ClientContext) -> bool {
     )
 }
 
+/// One deadline covers the login and the read. Without one, the login keeps
+/// the login timeout it inherits, which `SpawnConnection` also copies.
 async fn read_on_secondary(
     context: ClientContext,
     timeout_secs: u32,
 ) -> TdsResult<HashMap<u32, String>> {
-    let data_source = context.data_source.clone();
-    let mut client = TdsConnectionProvider::new()
-        .create_client(context, &data_source, None)
-        .await?;
-    read_alias_types(&mut client, timeout_secs).await
+    let lookup = async {
+        let data_source = context.data_source.clone();
+        let mut client = TdsConnectionProvider::new()
+            .create_client(context, &data_source, None)
+            .await?;
+        debug!(
+            client_connection_id = %client.client_connection_id(),
+            "alias-type lookup: logged in separately"
+        );
+        read_alias_types(&mut client, 0).await
+    };
+    if timeout_secs == 0 {
+        return lookup.await;
+    }
+    tokio::time::timeout(Duration::from_secs(timeout_secs.into()), lookup)
+        .await
+        .unwrap_or_else(|_| {
+            Err(TdsError::TimeoutError(TimeoutErrorType::String(
+                "alias-type lookup timed out".to_string(),
+            )))
+        })
 }
 
 /// Runs the lookup and leaves no batch open, even when it fails part-way, for
@@ -287,7 +309,7 @@ async fn read_alias_types(
                 }
             }
         }
-        Ok::<_, mssql_tds::error::Error>(names)
+        Ok::<_, TdsError>(names)
     }
     .await;
 
@@ -371,6 +393,18 @@ mod tests {
         stmt_state.column_metadata = columns;
     }
 
+    /// Leaves an application cursor open on the session with its row unread,
+    /// so a lookup sent on the session would be refused.
+    fn hold_session(h: &TestHandles) {
+        let dbc = dbc(h);
+        let mut state = dbc.inner.lock().unwrap();
+        let client = state.client.as_mut().unwrap();
+        dbc.runtime
+            .block_on(client.execute("SELECT 1".to_string(), ()))
+            .unwrap();
+        state.active_stmt = Some(h.stmt);
+    }
+
     fn type_name(h: &TestHandles, col: SqlUSmallInt, field: SqlUSmallInt) -> String {
         let mut buf = [0u16; 128];
         let mut written: SqlSmallInt = 0;
@@ -435,16 +469,7 @@ mod tests {
             ALIAS_TYPE_QUERY,
             lookup_response(&[(257, "phone_number")]),
         );
-        {
-            // An application cursor holds the session with its row unread, so
-            // a lookup sent on the session would be refused.
-            let mut state = dbc.inner.lock().unwrap();
-            let client = state.client.as_mut().unwrap();
-            dbc.runtime
-                .block_on(client.execute("SELECT 1".to_string(), ()))
-                .unwrap();
-            state.active_stmt = Some(h.stmt);
-        }
+        hold_session(&h);
         describe_columns(&h, &[257]);
 
         assert_eq!(type_name(&h, 1, SQL_DESC_TYPE_NAME), "phone_number");
@@ -454,7 +479,13 @@ mod tests {
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.alias_types, Some(expected));
         assert_eq!(state.active_stmt, Some(h.stmt));
-        assert!(state.client.as_ref().unwrap().has_open_batch());
+        let client = state.client.as_ref().unwrap();
+        assert!(client.has_open_batch());
+        assert_eq!(
+            dbc.trace.client_connection_id(),
+            Some(client.client_connection_id()),
+            "SQL_COPT_SS_CLIENT_CONNECTION_ID keeps naming the session"
+        );
         assert_eq!(
             state.database_user_name, None,
             "SQL_USER_NAME keeps to the session"
@@ -561,6 +592,38 @@ mod tests {
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.alias_types, None);
         assert!(state.client.is_some());
+    }
+
+    #[test]
+    fn connection_timeout_bounds_a_secondary_login_and_its_read() {
+        let names = || lookup_response(&[(257, "phone_number")]);
+        for (stalled, response, login_delay) in [
+            ("login", names(), Some(Duration::from_secs(10))),
+            ("read", names().with_delay(Duration::from_secs(10)), None),
+        ] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let dbc = dbc(&h);
+            let server = connect_mock_server(dbc, ALIAS_TYPE_QUERY, response);
+            hold_session(&h);
+            if let Some(delay) = login_delay {
+                server.set_login_delay(delay);
+            }
+            dbc.inner.lock().unwrap().connection_timeout = 1;
+            describe_columns(&h, &[257]);
+
+            let started = Instant::now();
+            assert_eq!(type_name(&h, 1, SQL_DESC_TYPE_NAME), "int", "{stalled}");
+
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{stalled}: {:?}",
+                started.elapsed()
+            );
+            let state = dbc.inner.lock().unwrap();
+            assert_eq!(state.alias_types, None, "{stalled}");
+            assert_eq!(state.active_stmt, Some(h.stmt), "{stalled}");
+            assert!(state.client.as_ref().unwrap().has_open_batch(), "{stalled}");
+        }
     }
 
     #[test]

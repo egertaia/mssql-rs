@@ -350,6 +350,18 @@ impl MockServer {
             );
         });
     }
+
+    /// Registers a delay for the server's answer to every later login, which
+    /// stalls a secondary connection's handshake while the DBC's own session
+    /// stays usable.
+    pub(crate) fn set_login_delay(&self, delay: std::time::Duration) {
+        self.server_runtime.block_on(async {
+            self.query_registry.lock().await.register(
+                mssql_mock_tds::LOGIN_DELAY_KEY,
+                mssql_mock_tds::QueryResponse::select_one().with_delay(delay),
+            );
+        });
+    }
 }
 
 /// Arms `stmt` with a pending `sp_unprepare` that will actually reach the wire.
@@ -449,6 +461,7 @@ pub(crate) fn connect_mock_server_with_trailing_info(
 
     let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
     let mut context = ClientContext::default();
+    context.set_connection_trace(std::sync::Arc::clone(&dbc.trace));
     context.user_name = "sa".to_string();
     context.password = "unused-by-the-mock-server".to_string();
     context.database = "master".to_string();

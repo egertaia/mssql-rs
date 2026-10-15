@@ -1342,6 +1342,8 @@ impl TdsClient {
     /// server and current database, for work that must not disturb this
     /// session's pending results. Connection retry is disabled on the copy:
     /// such a connection is short-lived and has no session state to recover.
+    /// The copy does not share this session's connection trace, whose client
+    /// connection ID must keep naming this session.
     ///
     /// `None` when the client was built without its login context.
     pub fn secondary_client_context(&self) -> Option<ClientContext> {
@@ -1350,6 +1352,7 @@ impl TdsClient {
             .database
             .clone_from(&self.negotiated_settings.database);
         context.connect_retry_count = 0;
+        context.connection_trace = None;
         Some(context)
     }
 
@@ -14535,6 +14538,42 @@ mod tests {
         assert_eq!(context.connect_retry_count, 0);
         assert_eq!(context.user_name, "app_login");
         assert_eq!(context.data_source, "tcp:localhost,1433");
+    }
+
+    #[test]
+    fn a_secondary_login_keeps_the_sessions_client_connection_id() {
+        use crate::handler::handler_factory::create_test_negotiated_settings_internal;
+        use crate::trace_context::ConnectionTrace;
+
+        let trace = Arc::new(ConnectionTrace::default());
+        let mut client_context = ClientContext::with_data_source("tcp:localhost,1433");
+        client_context.set_connection_trace(Arc::clone(&trace));
+        let session_id = uuid::Uuid::new_v4();
+        let mut settings = create_test_negotiated_settings_internal();
+        settings.client_connection_id = session_id;
+        let client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            client_context,
+            Vec::new(),
+        );
+
+        let secondary_context = client
+            .secondary_client_context()
+            .expect("the login context is retained");
+        assert!(secondary_context.connection_trace.is_none());
+        let mut secondary_settings = create_test_negotiated_settings_internal();
+        secondary_settings.client_connection_id = uuid::Uuid::new_v4();
+        let _secondary = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            secondary_settings,
+            crate::connection::execution_context::ExecutionContext::new(),
+            secondary_context,
+            Vec::new(),
+        );
+
+        assert_eq!(trace.client_connection_id(), Some(session_id));
     }
 
     #[tokio::test]

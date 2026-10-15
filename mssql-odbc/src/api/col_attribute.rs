@@ -142,7 +142,12 @@ fn sql_col_attribute_w_safe(
         field_identifier,
         SQL_DESC_TYPE_NAME | SQL_DESC_LOCAL_TYPE_NAME
     ) {
-        alias_type_name_for_column(stmt.parent_dbc(), stmt, usize::from(column_number))
+        let Ok(name) =
+            alias_type_name_for_column(stmt.parent_dbc(), stmt, usize::from(column_number))
+        else {
+            return SQL_ERROR;
+        };
+        name
     } else {
         None
     };

@@ -64,44 +64,50 @@ enum Route {
     },
 }
 
+/// A handle mutex poisoned by an earlier panic, which the entry point reports
+/// as `SQL_ERROR` like any other lock failure.
+pub(super) struct Poisoned;
+
 /// Returns the alias name of a result column whose `UserType` names an alias
 /// type, or `None` to report its base type.
 pub(super) fn alias_type_name_for_column(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     column_number: usize,
-) -> Option<String> {
+) -> Result<Option<String>, Poisoned> {
     let user_type = {
         let Ok(stmt_state) = stmt.inner.lock() else {
             error!("SQLColAttributeW: stmt mutex poisoned during alias-type lookup");
-            return None;
+            return Err(Poisoned);
         };
-        column_number
+        let Some(column) = column_number
             .checked_sub(1)
-            .and_then(|index| stmt_state.column_metadata.get(index))?
-            .user_type
+            .and_then(|index| stmt_state.column_metadata.get(index))
+        else {
+            return Ok(None);
+        };
+        column.user_type
     };
     if user_type < MIN_ALIAS_USER_TYPE {
-        return None;
+        return Ok(None);
     }
 
     refresh_alias_types(dbc);
 
     let Ok(state) = dbc.inner.lock() else {
         error!("SQLColAttributeW: dbc mutex poisoned during alias-type lookup");
-        return None;
+        return Err(Poisoned);
     };
-    let cache = state.alias_types.as_ref()?;
-    // While another call has the session checked out its key cannot be read,
-    // so the entry is taken as current, as `SQL_USER_NAME` does.
-    if !state
-        .client
-        .as_ref()
-        .is_none_or(|client| is_current(cache, client))
-    {
-        return None;
+    // While another call has the session checked out, the key cannot be
+    // checked: a `USE` in that call may have moved the session to a database
+    // where the same `UserType` names another type.
+    let (Some(cache), Some(client)) = (state.alias_types.as_ref(), state.client.as_ref()) else {
+        return Ok(None);
+    };
+    if !is_current(cache, client) {
+        return Ok(None);
     }
-    cache.names.get(&user_type).cloned()
+    Ok(cache.names.get(&user_type).cloned())
 }
 
 fn is_current(cache: &AliasTypeCache, client: &TdsClient) -> bool {
@@ -354,9 +360,10 @@ mod tests {
     use super::*;
     use crate::api::col_attribute::sql_col_attribute_w;
     use crate::api::odbc_types::{
-        SQL_DESC_LOCAL_TYPE_NAME, SQL_DESC_TYPE_NAME, SQL_SUCCESS, SqlPointer, SqlSmallInt,
-        SqlUSmallInt,
+        SQL_DESC_LOCAL_TYPE_NAME, SQL_DESC_TYPE_NAME, SQL_ERROR, SQL_SUCCESS, SqlPointer,
+        SqlSmallInt, SqlUSmallInt,
     };
+    use crate::api::txn::release_dbc_client;
     use crate::handles::handle_from_raw;
     use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
     use crate::test_support::{TestHandles, connect_mock_server};
@@ -537,6 +544,58 @@ mod tests {
             assert_eq!(type_name(&h, 1, SQL_DESC_TYPE_NAME), "phone_number");
             assert_eq!(dbc.inner.lock().unwrap().alias_types, Some(current.clone()));
         }
+    }
+
+    /// Another call holding the session may have run a `USE`, after which the
+    /// same `UserType` can name a different type, so names that cannot be
+    /// checked against the session are not reported.
+    #[test]
+    fn names_are_not_reported_while_another_call_holds_the_session() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = dbc(&h);
+        let server = connect_mock_server(
+            dbc,
+            ALIAS_TYPE_QUERY,
+            lookup_response(&[(257, "phone_number")]),
+        );
+        let mut stale = current_cache(dbc, &[(257, "invoice_number")]);
+        stale.catalog = "sales".to_string();
+        dbc.inner.lock().unwrap().alias_types = Some(stale.clone());
+        describe_columns(&h, &[257]);
+        let (client, _, _) = try_claim_idle_dbc_client(dbc).expect("the session is idle");
+
+        assert_eq!(type_name(&h, 1, SQL_DESC_TYPE_NAME), "int");
+
+        assert_eq!(server.connection_count(), 1, "nothing is read meanwhile");
+        assert_eq!(dbc.inner.lock().unwrap().alias_types, Some(stale));
+        release_dbc_client(dbc, client);
+    }
+
+    #[test]
+    fn a_poisoned_connection_fails_an_alias_columns_type_name() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = dbc(&h);
+        describe_columns(&h, &[257]);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dbc.inner.lock().unwrap();
+            panic!("poison the dbc lock");
+        }));
+
+        let mut buf = [0u16; 16];
+        let rc = unsafe {
+            sql_col_attribute_w(
+                h.stmt,
+                1,
+                SQL_DESC_TYPE_NAME,
+                buf.as_mut_ptr() as SqlPointer,
+                (buf.len() * 2) as SqlSmallInt,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(rc, SQL_ERROR);
+        dbc.inner.clear_poison();
     }
 
     #[test]

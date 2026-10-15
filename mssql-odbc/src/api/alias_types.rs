@@ -43,10 +43,13 @@ use crate::handles::dbc::{AliasTypeCache, ConnectionState, DbcHandle};
 const MIN_ALIAS_USER_TYPE: u32 = 256;
 
 /// The alias half of msodbcsql's `g_szSqlUdtQuery` (`sqlcstr.cpp`), with
-/// `MIN_REAL_USER_DATATYPE` substituted. Its `set implicit_transactions off`
-/// wrapper is unnecessary here, for the reason `fetch_database_user_name`
-/// gives.
-const ALIAS_TYPE_QUERY: &str = "SELECT usertype, name FROM systypes WHERE usertype >= 256";
+/// `MIN_REAL_USER_DATATYPE` substituted. On the idle route it runs on the
+/// application's session, where reading `systypes` would begin a transaction
+/// if the application had set `IMPLICIT_TRANSACTIONS ON`. As in msodbcsql, the
+/// option is turned off only inside `sp_executesql`, which restores it when
+/// the batch returns.
+const ALIAS_TYPE_QUERY: &str = "EXEC sp_executesql N'SET IMPLICIT_TRANSACTIONS OFF; \
+                                SELECT usertype, name FROM systypes WHERE usertype >= 256'";
 
 /// Where the lookup runs.
 enum Route {

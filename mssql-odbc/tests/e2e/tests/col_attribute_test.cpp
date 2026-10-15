@@ -42,6 +42,7 @@
 //   35. NameIsReportedWhileTheCursorIsOpen - alias name in both type-name fields
 //   36. NameIsReportedOnceTheRowsAreRead  - the idle session reads the names
 //   37. TypeCreatedAfterTheReadIsNamedAfterADatabaseChange - re-read on a database change
+//   38. LookupOnTheSessionBeginsNoImplicitTransaction - the application's setting is kept
 
 #include "odbc_concurrent_test.h"
 #include "odbc_test_fixture.h"
@@ -95,6 +96,20 @@ static std::string TextAttr(SQLHSTMT stmt, SQLUSMALLINT col, SQLUSMALLINT field)
         SQLColAttribute(stmt, col, field, value, sizeof(value), &length, nullptr);
     EXPECT_TRUE(SQL_SUCCEEDED(rc)) << "field " << field;
     return ODBCTestUtils::ToNarrow(SqlTString(value));
+}
+
+// Runs a single-value integer query on |stmt| and closes its cursor.
+static SQLINTEGER ScalarInt(SQLHSTMT stmt, const std::string& sql) {
+    SqlTString wide = ODBCTestUtils::ToSqlTStr(sql);
+    EXPECT_SQL_OK(SQLExecDirect(stmt, const_cast<SQLTCHAR*>(wide.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, stmt);
+    EXPECT_SQL_OK(SQLFetch(stmt), SQL_HANDLE_STMT, stmt);
+    SQLINTEGER value = -1;
+    SQLLEN indicator = 0;
+    EXPECT_SQL_OK(SQLGetData(stmt, 1, SQL_C_SLONG, &value, sizeof(value), &indicator),
+                  SQL_HANDLE_STMT, stmt);
+    SQLCloseCursor(stmt);
+    return value;
 }
 
 static void ExpectVariantType(SQLHSTMT stmt, SQLUSMALLINT col, SQLLEN expected) {
@@ -184,6 +199,9 @@ class AliasTypeLiveTest : public ColAttributeLiveTest {
 protected:
     void TearDown() override {
         SQLCloseCursor(stmt_);
+        // A transaction left open by a failed run would roll the drops back at
+        // disconnect.
+        ExecDirectIgnoreError("IF @@TRANCOUNT > 0 ROLLBACK; SET IMPLICIT_TRANSACTIONS OFF");
         for (const std::string& name : typeNames_) {
             ExecDirectIgnoreError("DROP TYPE dbo." + name);
         }
@@ -289,6 +307,27 @@ ODBC_TEST_F(AliasTypeLiveTest, TypeCreatedAfterTheReadIsNamedAfterADatabaseChang
     SelectAliasColumn(later);
     FetchAliasValues();
     EXPECT_EQ(later, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+}
+
+// The application can enable implicit transactions itself. msodbcsql reads the
+// names inside sp_executesql with the option turned off there (sqlcstr.cpp
+// g_szSqlUdtQuery), so the lookup on the idle session neither begins a
+// transaction nor changes the application's setting.
+ODBC_TEST_F(AliasTypeLiveTest, LookupOnTheSessionBeginsNoImplicitTransaction) {
+    const std::string typeName = CreateAliasType();
+    SelectAliasColumn(typeName);
+    FetchAliasValues();
+
+    SQLHSTMT other = AllocStmt();
+    SqlTString implicitOn = ODBCTestUtils::ToSqlTStr("SET IMPLICIT_TRANSACTIONS ON");
+    ASSERT_SQL_OK(SQLExecDirect(other, const_cast<SQLTCHAR*>(implicitOn.c_str()), SQL_NTS),
+                  SQL_HANDLE_STMT, other);
+    ASSERT_EQ(0, ScalarInt(other, "SELECT @@TRANCOUNT"));
+
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+
+    EXPECT_EQ(0, ScalarInt(other, "SELECT @@TRANCOUNT"));
+    EXPECT_EQ(2, ScalarInt(other, "SELECT @@OPTIONS & 2"));
 }
 
 // Matches retail msodbcsql 18.6.2.1. GetIRDField in

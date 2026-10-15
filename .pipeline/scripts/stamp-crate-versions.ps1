@@ -51,7 +51,7 @@ function Assert-SemVer {
 function Get-PackageVersionMatch {
     param([Parameter(Mandatory = $true)][string]$Content, [Parameter(Mandatory = $true)][string]$Path)
 
-    $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*package[ \t]*\][ \t]*(?:#[^\r\n]*)?\r?\n.*?(?=^[ \t]*\[|\z)')
+    $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[[ \t]*package[ \t]*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     # Quoted/dotted package keys and multiline strings need a TOML parser; do
     # not let them introduce a second declaration that a line matcher misses.
     if ($sections.Count -ne 1 -or
@@ -98,8 +98,8 @@ function Set-MssqlTdsDependencyVersion {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
-    $declarations = [regex]::Matches($Content, '(?m)^[ \t]*(?:mssql-tds\b|["'']mssql-tds["''])')
-    $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[dependencies\][ \t]*(?:#[^\r\n]*)?\r?\n.*?(?=^[ \t]*\[|\z)')
+    $declarations = [regex]::Matches($Content, '(?m)^[ \t]*(?:mssql-tds|["'']mssql-tds["''])[ \t]*[=.]')
+    $sections = [regex]::Matches($Content, '(?ms)^[ \t]*\[dependencies\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|\z).*?(?=^[ \t]*\[|\z)')
     if ($declarations.Count -ne 1 -or $sections.Count -ne 1 -or
         $Content -match '(?m)^[ \t]*\[[^\r\n]*mssql-tds') {
         throw "Expected one inline mssql-tds dependency in [dependencies] in $Path"

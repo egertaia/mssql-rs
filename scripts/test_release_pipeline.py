@@ -1911,6 +1911,26 @@ def test_crate_stamp_rejects_missing_later_manifest(stamp_manifests):
     assert_stamp_rejected(stamp_manifests)
 
 
+@pytest.mark.parametrize("header", ["[package]", "[dependencies]"])
+@pytest.mark.parametrize("what_if", [False, True])
+def test_crate_stamp_rejects_duplicate_header_at_eof(stamp_manifests, header, what_if):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    path.write_bytes(path.read_bytes() + header.encode())
+    assert_stamp_rejected(stamp_manifests, WhatIf=what_if)
+
+
+def test_crate_stamp_preserves_hyphenated_feature_name(stamp_manifests):
+    path = stamp_manifests / "mssql-mock-tds" / "Cargo.toml"
+    feature = '\n[features]\nmssql-tds-test-util = ["mssql-tds/test-util"]\n'
+    path.write_bytes(path.read_bytes() + feature.encode())
+    result = run_crate_stamp(stamp_manifests)
+    assert result.returncode == 0, result.stderr
+    manifest = tomllib.loads(path.read_text())
+    assert manifest["features"]["mssql-tds-test-util"] == ["mssql-tds/test-util"]
+    assert manifest["dependencies"]["mssql-tds"]["version"] == "0.3.0-dev.20261015.123"
+    assert manifest["package"]["version"] == "0.3.0-dev.20261015.123"
+
+
 def test_crate_stamp_rejects_nonofficial_build_metadata(stamp_manifests):
     path = stamp_manifests / "mssql-tds" / "Cargo.toml"
     path.write_text(path.read_text().replace("0.3.0", "0.3.0+build.1"), encoding="utf-8")

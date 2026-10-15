@@ -63,6 +63,19 @@ def test_sync_tests_run_in_shared_validation():
     assert step.get("condition", "succeeded()") == "succeeded()"
     assert not step.get("continueOnError", False)
 
+    linux = next(job for job in build["jobs"] if job.get("job") == "Build_Linux")
+    step = next(
+        step for step in linux["steps"]
+        if step.get("displayName") == "Test ADO sync pipeline"
+    )
+    script = step["bash"]
+    assert "set -euo pipefail" in script
+    assert 'assert shutil.which("bash")' in script
+    assert "python -m pytest scripts/test_sync_pipeline.py -q -rs" in script
+    assert script.index('assert shutil.which("bash")') < script.index("python -m pytest")
+    assert step.get("condition", "succeeded()") == "succeeded()"
+    assert not step.get("continueOnError", False)
+
 
 @pytest.fixture
 def run_sync(tmp_path, sync_step):

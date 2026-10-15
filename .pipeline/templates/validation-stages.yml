@@ -296,6 +296,15 @@ stages:
           set -euo pipefail
           python3 -m unittest discover -s .pipeline/scripts -p 'test_*.py' -v
         displayName: Test pipeline helper scripts
+      # Windows agents may lack Bash; enforce the mocked sync flows on Linux.
+      - bash: |
+          set -euo pipefail
+          python3 -m venv "$AGENT_TEMPDIRECTORY/sync-tests"
+          source "$AGENT_TEMPDIRECTORY/sync-tests/bin/activate"
+          python -m pip install --quiet pytest pyyaml
+          python -c 'import shutil; assert shutil.which("bash"), "Bash is required for sync regression tests"'
+          python -m pytest scripts/test_sync_pipeline.py -q -rs
+        displayName: Test ADO sync pipeline
       - template: build-template-container.yml
         parameters:
           architecture: x64

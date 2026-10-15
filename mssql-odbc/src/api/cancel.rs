@@ -10,7 +10,6 @@
 //! first, then waits for the interrupted call to finish settlement and release
 //! its client and statement state. Diagnostics belong to the interrupted call.
 
-use std::sync::TryLockError;
 use tracing::{debug, error};
 
 use super::exec_common::finish_dae_unwind;
@@ -71,25 +70,9 @@ fn sql_cancel_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
         return SQL_SUCCESS;
     }
     let client = {
-        // Calls not participating in cancellation can briefly hold inner.
-        // An idle cancel waits for them only when a DAE sequence is parked.
-        let mut stmt_state = match stmt.inner.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::WouldBlock) => match dae_may_be_parked(stmt, statement_handle) {
-                Ok(false) => return SQL_SUCCESS,
-                Ok(true) => match stmt.inner.lock() {
-                    Ok(state) => state,
-                    Err(_) => {
-                        error!("SQLCancel: stmt mutex poisoned");
-                        return SQL_ERROR;
-                    }
-                },
-                Err(rc) => return rc,
-            },
-            Err(TryLockError::Poisoned(_)) => {
-                error!("SQLCancel: stmt mutex poisoned");
-                return SQL_ERROR;
-            }
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLCancel: stmt mutex poisoned");
+            return SQL_ERROR;
         };
         if stmt_state.dae.is_none() {
             let rc =
@@ -126,17 +109,6 @@ fn sql_cancel_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn 
     );
 
     SQL_SUCCESS
-}
-
-/// Parking moves the client off the DBC while keeping this statement's busy
-/// claim, which is visible without `inner`. Only then is a brief `inner`
-/// holder worth waiting for; the cancellation fence keeps new calls out.
-fn dae_may_be_parked(stmt: &StmtHandle, statement_handle: SqlHandle) -> Result<bool, SqlReturn> {
-    let Ok(state) = stmt.parent_dbc().inner.lock() else {
-        error!("SQLCancel: dbc mutex poisoned");
-        return Err(SQL_ERROR);
-    };
-    Ok(state.active_stmt == Some(statement_handle) && state.client.is_none())
 }
 
 #[cfg(test)]
@@ -461,19 +433,60 @@ mod tests {
     }
 
     #[test]
-    fn cancel_during_a_brief_stmt_lock_preserves_its_diagnostics() {
-        let h = TestHandles::with_env_dbc_stmt();
+    fn idle_cancel_waits_for_stmt_lock_then_closes_cursor_and_releases_connection() {
+        use crate::api::odbc_types::*;
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other = h.alloc_extra_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
-        let mut state = stmt.inner.lock().unwrap();
-        state.diag_records.push(crate::error::DiagRecord::new(
-            *b"HY008",
-            0,
-            "execution cancelled",
-        ));
-        // Holding inner on this thread would deadlock a blocking SQLCancel.
-        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLCancel(h.stmt) });
-        assert_eq!(state.diag_records.len(), 1);
-        assert_eq!(state.diag_records[0].sql_state, *b"HY008");
+        let dbc = stmt.parent_dbc();
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            "SELECT 1",
+            QueryResponse::new(
+                vec![ColumnDefinition::new("", SqlDataType::Int)],
+                (1..=3)
+                    .map(|n| Row::new(vec![ColumnValue::Int(n)]))
+                    .collect(),
+            ),
+        );
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+        let exec = |handle| unsafe {
+            crate::api::SQLExecDirectW(handle, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+        };
+        assert_eq!(SQL_SUCCESS, exec(h.stmt));
+        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+        assert_eq!(SQL_ERROR, exec(other));
+        let raw = h.stmt as usize;
+        std::thread::scope(|scope| {
+            let state = stmt.inner.lock().unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let rc = unsafe { crate::api::SQLCancel(raw as SqlHandle) };
+                finished_tx.send(rc).unwrap();
+            });
+            started_rx.recv().unwrap();
+            let waiting = finished_rx.recv_timeout(Duration::from_millis(100));
+            drop(state);
+            let rc = finished_rx.recv_timeout(Duration::from_secs(5));
+            worker.join().unwrap();
+            assert_eq!(waiting, Err(mpsc::RecvTimeoutError::Timeout));
+            assert_eq!(rc.unwrap(), SQL_SUCCESS_WITH_INFO);
+        });
+        {
+            let state = stmt.inner.lock().unwrap();
+            assert!(!state.has_state(crate::handles::stmt::STMT_STATE_CURSOR_OPEN));
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(state.diag_records[0].sql_state, *b"01S05");
+        }
+        assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+        assert_eq!(SQL_SUCCESS, exec(other));
+        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(other) });
     }
 
     #[test]

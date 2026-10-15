@@ -68,14 +68,22 @@ enum Route {
 /// as `SQL_ERROR` like any other lock failure.
 pub(super) struct Poisoned;
 
+/// An alias type name and the result set it was read for.
+pub(super) struct ColumnAlias {
+    pub(super) name: String,
+    pub(super) result_generation: u64,
+}
+
 /// Returns the alias name of a result column whose `UserType` names an alias
-/// type, or `None` to report its base type.
+/// type, or `None` to report its base type. The lookup runs without the
+/// statement lock, so the caller applies the name only while
+/// `result_generation` is still current.
 pub(super) fn alias_type_name_for_column(
     dbc: &DbcHandle,
     stmt: &StmtHandle,
     column_number: usize,
-) -> Result<Option<String>, Poisoned> {
-    let user_type = {
+) -> Result<Option<ColumnAlias>, Poisoned> {
+    let (user_type, result_generation) = {
         let Ok(stmt_state) = stmt.inner.lock() else {
             error!("SQLColAttributeW: stmt mutex poisoned during alias-type lookup");
             return Err(Poisoned);
@@ -86,7 +94,7 @@ pub(super) fn alias_type_name_for_column(
         else {
             return Ok(None);
         };
-        column.user_type
+        (column.user_type, stmt_state.result_generation)
     };
     if user_type < MIN_ALIAS_USER_TYPE {
         return Ok(None);
@@ -107,7 +115,10 @@ pub(super) fn alias_type_name_for_column(
     if !is_current(cache, client) {
         return Ok(None);
     }
-    Ok(cache.names.get(&user_type).cloned())
+    Ok(cache.names.get(&user_type).map(|name| ColumnAlias {
+        name: name.clone(),
+        result_generation,
+    }))
 }
 
 fn is_current(cache: &AliasTypeCache, client: &TdsClient) -> bool {
@@ -360,8 +371,8 @@ mod tests {
     use super::*;
     use crate::api::col_attribute::sql_col_attribute_w;
     use crate::api::odbc_types::{
-        SQL_DESC_LOCAL_TYPE_NAME, SQL_DESC_TYPE_NAME, SQL_ERROR, SQL_SUCCESS, SqlPointer,
-        SqlSmallInt, SqlUSmallInt,
+        SQL_DESC_LOCAL_TYPE_NAME, SQL_DESC_TYPE_NAME, SQL_ERROR, SQL_SUCCESS, SqlHandle,
+        SqlPointer, SqlSmallInt, SqlUSmallInt,
     };
     use crate::api::txn::release_dbc_client;
     use crate::handles::handle_from_raw;
@@ -416,11 +427,15 @@ mod tests {
     }
 
     fn type_name(h: &TestHandles, col: SqlUSmallInt, field: SqlUSmallInt) -> String {
+        type_name_of(h.stmt, col, field)
+    }
+
+    fn type_name_of(stmt: SqlHandle, col: SqlUSmallInt, field: SqlUSmallInt) -> String {
         let mut buf = [0u16; 128];
         let mut written: SqlSmallInt = 0;
         let rc = unsafe {
             sql_col_attribute_w(
-                h.stmt,
+                stmt,
                 col,
                 field,
                 buf.as_mut_ptr() as SqlPointer,
@@ -569,6 +584,42 @@ mod tests {
         assert_eq!(server.connection_count(), 1, "nothing is read meanwhile");
         assert_eq!(dbc.inner.lock().unwrap().alias_types, Some(stale));
         release_dbc_client(dbc, client);
+    }
+
+    /// The lookup runs without the statement lock, so another call can replace
+    /// the result while it waits; the name read for the old result is not
+    /// applied to the new one.
+    #[test]
+    fn a_name_read_for_a_replaced_result_is_not_applied() {
+        let h = TestHandles::with_env_dbc_stmt();
+        let dbc = dbc(&h);
+        let _server = connect_mock_server(
+            dbc,
+            ALIAS_TYPE_QUERY,
+            lookup_response(&[(257, "phone_number")]).with_delay(Duration::from_secs(2)),
+        );
+        describe_columns(&h, &[257]);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let raw = h.stmt as usize;
+
+        let name = std::thread::scope(|scope| {
+            let describe =
+                scope.spawn(move || type_name_of(raw as SqlHandle, 1, SQL_DESC_TYPE_NAME));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while dbc.inner.lock().unwrap().client.is_some() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                dbc.inner.lock().unwrap().client.is_none(),
+                "the lookup holds the session"
+            );
+            stmt.inner.lock().unwrap().begin_batch(int_columns(1));
+            describe.join().unwrap()
+        });
+
+        assert_eq!(name, "int");
+        let expected = current_cache(dbc, &[(257, "phone_number")]);
+        assert_eq!(dbc.inner.lock().unwrap().alias_types, Some(expected));
     }
 
     #[test]

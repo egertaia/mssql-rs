@@ -138,16 +138,16 @@ fn sql_col_attribute_w_safe(
 ) -> SqlReturn {
     // Resolved before the stmt lock: the lookup takes the DBC lock first and
     // may need the session for a round trip.
-    let alias_type_name = if matches!(
+    let alias = if matches!(
         field_identifier,
         SQL_DESC_TYPE_NAME | SQL_DESC_LOCAL_TYPE_NAME
     ) {
-        let Ok(name) =
+        let Ok(alias) =
             alias_type_name_for_column(stmt.parent_dbc(), stmt, usize::from(column_number))
         else {
             return SQL_ERROR;
         };
-        name
+        alias
     } else {
         None
     };
@@ -220,6 +220,10 @@ fn sql_col_attribute_w_safe(
         return SQL_SUCCESS;
     }
 
+    // Another call may have replaced the result while the lookup ran.
+    let alias_type_name = alias
+        .filter(|alias| alias.result_generation == stmt_state.result_generation)
+        .map(|alias| alias.name);
     let meta = &stmt_state.column_metadata[(column_number - 1) as usize];
     let Some(attr) = column_attribute(meta, field_identifier, alias_type_name.as_deref()) else {
         post_diag(&mut stmt_state, ERR_INVALID_DESCRIPTOR_FIELD);

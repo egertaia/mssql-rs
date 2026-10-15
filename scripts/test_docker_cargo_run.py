@@ -4,6 +4,7 @@
 """Cargo credential forwarding contracts; no Docker daemon or feed access needed."""
 
 import os
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -67,11 +68,15 @@ esac
             key: value for key, value in os.environ.items()
             if not key.startswith("CARGO_") and key not in ("BUILD_REASON", "DOCKER_RUN_EXIT")
         }
-        env.update(values)
+        # Export inside Bash so WSL receives the same inputs as Git Bash/Linux.
+        setup = "unset " + " ".join((*_TOKENS, *_PROVIDERS, "BUILD_REASON", "DOCKER_RUN_EXIT")) + "; "
+        setup += "".join(
+            f"export {name}={shlex.quote(value)}; " for name, value in values.items()
+        )
         result = subprocess.run(
             [
                 _BASH, "-c",
-                'chmod +x bin/docker bin/df; export PATH="$PWD/bin:$PATH"; '
+                setup + 'chmod +x bin/docker bin/df; export PATH="$PWD/bin:$PATH"; '
                 'exec bash ./docker-cargo-run.sh "$@"',
                 "test-wrapper", *_ARGS,
             ],

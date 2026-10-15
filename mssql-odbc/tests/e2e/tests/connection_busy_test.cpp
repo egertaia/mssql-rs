@@ -21,6 +21,7 @@
 // Tests that require a live SQL Server are gated by ODBCTestConfig::HasConnection().
 
 #include "odbc_test_fixture.h"
+#include "odbc_concurrent_test.h"
 
 #include <string>
 
@@ -50,6 +51,70 @@ protected:
                                 SQL_INTEGER, 0, 0, value, 0, indicator);
     }
 };
+
+// Benefits-from-mock-tds: cancel.rs pins cursor reset and drain errors; this
+// checks connection reuse through the Driver Manager, which may suppress 01S05.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelReleasesConnectionLikeFreeStmtClose) {
+    SQLCHAR version[32] = {};
+    ASSERT_SQL_OK(SQLGetInfoA(dbc_, SQL_DRIVER_VER, version, sizeof(version), nullptr),
+                  SQL_HANDLE_DBC, dbc_);
+    Log("SQL_DRIVER_VER=" + std::string(reinterpret_cast<const char*>(version)));
+    const auto token = 1000 + Worker() * 100 + Iteration();
+    const auto query = "SELECT " + std::to_string(token) +
+                      " + n FROM (VALUES (1), (2), (3)) AS v(n) ORDER BY n";
+    SQLHSTMT other = AllocStmt();
+    for (bool cancel : {false, true}) {
+        for (int fetched : {0, 1, 3}) {
+            SCOPED_TRACE(::testing::Message() << "cancel=" << cancel << ", fetched=" << fetched);
+            ASSERT_SQL_OK(Run(stmt_, query), SQL_HANDLE_STMT, stmt_);
+            for (int row = 0; row < fetched; ++row) {
+                ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            }
+            if (fetched < 3) {
+                ASSERT_EQ(SQL_ERROR, Run(other, "SELECT 42"));
+                EXPECT_SQLSTATE(SQL_HANDLE_STMT, other, "HY000");
+            } else {
+                ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+            }
+            ASSERT_SQL_OK(cancel ? SQLCancel(stmt_) : SQLFreeStmt(stmt_, SQL_CLOSE),
+                          SQL_HANDLE_STMT, stmt_);
+            SQLSMALLINT columns = -1;
+            EXPECT_EQ(SQL_ERROR, SQLNumResultCols(stmt_, &columns));
+            EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+            ASSERT_SQL_OK(Run(other, "SELECT " + std::to_string(token)),
+                          SQL_HANDLE_STMT, other);
+            ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
+            SQLINTEGER value = 0;
+            ASSERT_SQL_OK(SQLGetData(other, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                          SQL_HANDLE_STMT, other);
+            EXPECT_EQ(token, value);
+            ASSERT_SQL_OK(SQLFreeStmt(other, SQL_CLOSE), SQL_HANDLE_STMT, other);
+        }
+    }
+}
+
+// Benefits-from-mock-tds: verify reuse of the server prepare handle as well as
+// the observable preservation of the plan and application bindings.
+ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelPreservesPreparedStatementAndBindings) {
+    SQLINTEGER parameter = 1000 + Worker() * 100 + Iteration();
+    SQLLEN indicator = 0;
+    SQLINTEGER value = 0;
+    ASSERT_SQL_OK(Prepare(stmt_, "SELECT ? FROM (VALUES (1), (2), (3)) AS v(n)"),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &indicator), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
+                  SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+    for (int execution = 0; execution < 2; ++execution) {
+        ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+        EXPECT_EQ(parameter, value);
+        ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+        ++parameter;
+    }
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_RESET_PARAMS), SQL_HANDLE_STMT, stmt_);
+}
 
 // A first execution of a prepared statement uses sp_prepexec. Its output
 // handle trails the row result on the wire, but it is part of the same RPC

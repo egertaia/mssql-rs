@@ -187,7 +187,10 @@ on the `master` branch.
   Cross-thread `SQLCancel` is an exception: it only signals the execution
   token and must neither clear nor post diagnostics belonging to the
   interrupted call. Cancelling a parked DAE sequence still clears its
-  diagnostics before unwinding.
+  diagnostics before unwinding. An idle `SQLCancel` uses the shared
+  `SQLFreeStmt(SQL_CLOSE)` cleanup and replaces stale diagnostics, appending
+  `01S05` only if close succeeds. Keep its cancellation fence through the drain;
+  do not re-enter `begin_operation` while holding that fence (AB#49386).
 - **A success code is a promise about the caller's buffer, so never report
   `SQL_SUCCESS` for a call that wrote less than the indicator claims.** Report
   `SQL_SUCCESS_WITH_INFO` with `01004` when a read truncates, so the caller knows

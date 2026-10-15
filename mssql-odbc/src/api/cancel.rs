@@ -3,10 +3,10 @@
 
 //! Implementation of `SQLCancel`.
 //!
-//! `SQLCancel` has two distinct jobs in ODBC. Against a statement executing on
-//! another thread it asks the server to abandon the running command; against a
-//! statement in the "Need Data" state it abandons a data-at-execution sequence
-//! so the statement can be executed again. Cross-thread cancellation signals
+//! Against a statement executing on another thread, `SQLCancel` asks the server
+//! to abandon the running command. In "Need Data" it abandons the parked
+//! data-at-execution sequence; otherwise it performs `SQLFreeStmt(SQL_CLOSE)`
+//! and reports `01S05`. Cross-thread cancellation signals
 //! first, then waits for the interrupted call to finish settlement and release
 //! its client and statement state. Diagnostics belong to the interrupted call.
 
@@ -14,7 +14,10 @@ use std::sync::TryLockError;
 use tracing::{debug, error};
 
 use super::exec_common::finish_dae_unwind;
-use crate::api::odbc_types::{SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SqlHandle, SqlReturn};
+use super::sqlstate::{WARN_CANCEL_TREATED_AS_CLOSE, post_diag};
+use crate::api::odbc_types::{
+    SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
+};
 use crate::error::free_errors;
 use crate::handles::stmt::STMT_STATE_EXEC_STARTED;
 use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
@@ -52,7 +55,10 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
         HandleType::Stmt,
         "SQLCancel: handle is not a STMT"
     );
+    sql_cancel_safe(statement_handle, stmt)
+}
 
+fn sql_cancel_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
     let cancellation = match stmt.cancel_operation() {
         Ok(cancellation) => cancellation,
         Err(rc) => return rc,
@@ -85,13 +91,24 @@ unsafe fn sql_cancel_impl(statement_handle: SqlHandle) -> SqlReturn {
                 return SQL_ERROR;
             }
         };
+        if stmt_state.dae.is_none() {
+            let rc =
+                super::close_cursor::free_stmt_close_locked(statement_handle, stmt, stmt_state);
+            if !matches!(rc, SQL_SUCCESS | SQL_SUCCESS_WITH_INFO) {
+                return rc;
+            }
+            let Ok(mut stmt_state) = stmt.inner.lock() else {
+                error!("SQLCancel: stmt mutex poisoned");
+                return SQL_ERROR;
+            };
+            post_diag(&mut stmt_state, WARN_CANCEL_TREATED_AS_CLOSE);
+            return SQL_SUCCESS_WITH_INFO;
+        }
         if stmt_state
             .dae
             .as_ref()
-            .is_none_or(|dae| dae.call_in_flight())
+            .is_some_and(|dae| dae.call_in_flight())
         {
-            // Never clear or post diagnostics for the interrupted call, even
-            // if it finished before we acquired this lock.
             return SQL_SUCCESS;
         }
         free_errors(&mut stmt_state);
@@ -144,9 +161,227 @@ mod tests {
     }
 
     #[test]
-    fn cancel_outside_need_data_is_a_success_noop() {
+    fn idle_cancel_reports_free_stmt_close_and_replaces_stale_diagnostics() {
+        use crate::api::odbc_types::SQL_SUCCESS_WITH_INFO;
+
         let h = TestHandles::with_env_dbc_stmt();
-        assert_eq!(SQL_SUCCESS, unsafe { sql_cancel(h.stmt) });
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.inner
+            .lock()
+            .unwrap()
+            .diag_records
+            .push(crate::error::DiagRecord::new(*b"HY008", 0, "stale error"));
+        for _ in 0..2 {
+            assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+                crate::api::SQLCancel(h.stmt)
+            });
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(state.diag_records[0].sql_state, *b"01S05");
+            assert_eq!(state.diag_records[0].native_error, 0);
+            assert!(
+                state.diag_records[0]
+                    .message
+                    .ends_with("Cancel treated as FreeStmt/Close")
+            );
+        }
+    }
+
+    #[test]
+    fn idle_cancel_closes_cursor_and_releases_connection_like_free_stmt() {
+        use crate::api::odbc_types::*;
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        for cancel in [false, true] {
+            for fetched in [0, 1, 3] {
+                let mut h = TestHandles::with_env_dbc_stmt();
+                let other = h.alloc_extra_stmt();
+                let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+                let dbc = stmt.parent_dbc();
+                let rows = (1..=3)
+                    .map(|n| Row::new(vec![ColumnValue::Int(n)]))
+                    .collect();
+                let _server = crate::test_support::connect_mock_server(
+                    dbc,
+                    "SELECT 1",
+                    QueryResponse::new(vec![ColumnDefinition::new("", SqlDataType::Int)], rows),
+                );
+                let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+                let exec = |handle| unsafe {
+                    crate::api::SQLExecDirectW(
+                        handle,
+                        sql.as_ptr(),
+                        i16::try_from(sql.len()).unwrap(),
+                    )
+                };
+                assert_eq!(SQL_SUCCESS, exec(h.stmt));
+                for _ in 0..fetched {
+                    assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+                }
+                if fetched < 3 {
+                    assert_eq!(SQL_ERROR, exec(other));
+                    assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(h.stmt));
+                } else {
+                    assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
+                }
+
+                if cancel {
+                    assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+                        crate::api::SQLCancel(h.stmt)
+                    });
+                    assert_eq!(
+                        stmt.inner.lock().unwrap().diag_records[0].sql_state,
+                        *b"01S05"
+                    );
+                } else {
+                    assert_eq!(SQL_SUCCESS, unsafe {
+                        crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
+                    });
+                }
+                assert!(dbc.inner.lock().unwrap().active_stmt.is_none());
+                let mut columns = -1;
+                assert_eq!(SQL_ERROR, unsafe {
+                    crate::api::SQLNumResultCols(h.stmt, &mut columns)
+                });
+                assert_eq!(
+                    stmt.inner.lock().unwrap().diag_records[0].sql_state,
+                    *b"HY010"
+                );
+                assert_eq!(SQL_ERROR, unsafe { crate::api::SQLFetch(h.stmt) });
+                assert_eq!(
+                    stmt.inner.lock().unwrap().diag_records[0].sql_state,
+                    *b"24000"
+                );
+                assert_eq!(SQL_SUCCESS, exec(other));
+                assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(other) });
+                assert_eq!(SQL_SUCCESS, unsafe {
+                    crate::api::SQLFreeStmt(other, SQL_CLOSE)
+                });
+                assert_eq!(SQL_SUCCESS, exec(h.stmt));
+            }
+        }
+    }
+
+    #[test]
+    fn idle_cancel_preserves_close_errors_without_posting_success_warning() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::test_client_support::{
+            done_select_no_more, sql_error, tds_client_from_int_rows_with_trailing_tokens,
+        };
+
+        for deferred in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc = stmt.parent_dbc();
+            dbc.inner.lock().unwrap().client = Some(tds_client_from_int_rows_with_trailing_tokens(
+                vec![vec![1]],
+                vec![
+                    sql_error(50000, 16, "trailing close error"),
+                    done_select_no_more(),
+                ],
+            ));
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            });
+            if deferred {
+                assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+                assert!(stmt.inner.lock().unwrap().pending_fetch_error.is_some());
+            }
+            assert_eq!(SQL_ERROR, unsafe { crate::api::SQLCancel(h.stmt) });
+            let state = stmt.inner.lock().unwrap();
+            assert_eq!(state.diag_records.len(), 1);
+            assert_eq!(state.diag_records[0].sql_state, *b"42000");
+            assert_eq!(state.diag_records[0].native_error, 50000);
+            assert!(
+                state.diag_records[0]
+                    .message
+                    .contains("trailing close error")
+            );
+        }
+    }
+
+    #[test]
+    fn idle_cancel_appends_warning_after_close_info() {
+        use crate::api::odbc_types::*;
+        use mssql_tds::test_client_support::{
+            done_select_no_more, info, tds_client_from_int_rows_with_trailing_tokens,
+        };
+
+        let h = TestHandles::with_env_dbc_stmt();
+        h.mark_dbc_connected();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        stmt.parent_dbc().inner.lock().unwrap().client =
+            Some(tds_client_from_int_rows_with_trailing_tokens(
+                vec![vec![1]],
+                vec![info(50000, 10, "close info"), done_select_no_more()],
+            ));
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+        assert_eq!(SQL_SUCCESS, unsafe {
+            crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+        });
+        assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+            crate::api::SQLCancel(h.stmt)
+        });
+        let state = stmt.inner.lock().unwrap();
+        assert_eq!(state.diag_records.len(), 2);
+        assert_eq!(state.diag_records[0].sql_state, *b"01000");
+        assert!(state.diag_records[0].message.contains("close info"));
+        assert_eq!(state.diag_records[1].sql_state, *b"01S05");
+    }
+
+    #[test]
+    fn idle_cancel_of_exhausted_cursor_does_not_drain_another_statement() {
+        use crate::api::odbc_types::*;
+        use mssql_mock_tds::{ColumnDefinition, ColumnValue, QueryResponse, Row, SqlDataType};
+
+        let mut h = TestHandles::with_env_dbc_stmt();
+        let other = h.alloc_extra_stmt();
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+        let dbc = stmt.parent_dbc();
+        let _server = crate::test_support::connect_mock_server(
+            dbc,
+            "SELECT 1",
+            QueryResponse::new(
+                vec![ColumnDefinition::new("", SqlDataType::Int)],
+                (1..=3)
+                    .map(|n| Row::new(vec![ColumnValue::Int(n)]))
+                    .collect(),
+            ),
+        );
+        let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+        for handle in [h.stmt, other] {
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLExecDirectW(handle, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            });
+            if handle == h.stmt {
+                for _ in 0..3 {
+                    assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(handle) });
+                }
+                assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(handle) });
+            }
+        }
+        assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+            crate::api::SQLCancel(h.stmt)
+        });
+        assert_eq!(dbc.inner.lock().unwrap().active_stmt, Some(other));
+        for expected in 1..=3 {
+            assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(other) });
+            let mut value = 0i32;
+            assert_eq!(SQL_SUCCESS, unsafe {
+                crate::api::SQLGetData(
+                    other,
+                    1,
+                    SQL_C_LONG,
+                    (&mut value as *mut i32).cast(),
+                    4,
+                    std::ptr::null_mut(),
+                )
+            });
+            assert_eq!(value, expected);
+        }
+        assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(other) });
     }
 
     #[test]
@@ -226,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_cancel_never_waits_for_stmt_lock_or_changes_diagnostics() {
+    fn cancel_during_a_brief_stmt_lock_preserves_its_diagnostics() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         let mut state = stmt.inner.lock().unwrap();
@@ -237,9 +472,6 @@ mod tests {
         ));
         // Holding inner on this thread would deadlock a blocking SQLCancel.
         assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLCancel(h.stmt) });
-        drop(state);
-        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLCancel(h.stmt) });
-        let state = stmt.inner.lock().unwrap();
         assert_eq!(state.diag_records.len(), 1);
         assert_eq!(state.diag_records[0].sql_state, *b"HY008");
     }
@@ -258,9 +490,13 @@ mod tests {
             "SELECT 1",
             QueryResponse::select_one().with_delay(Duration::from_millis(100)),
         );
-        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLCancel(h.stmt) });
+        assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+            crate::api::SQLCancel(h.stmt)
+        });
         let previous = stmt.new_execution_cancel().unwrap();
-        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLCancel(h.stmt) });
+        assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+            crate::api::SQLCancel(h.stmt)
+        });
         let fresh = stmt.new_execution_cancel().unwrap();
         // A late signal through the previous execution must remain isolated.
         previous.cancel();
@@ -860,7 +1096,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             let cancelled = Instant::now();
             assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLCancel(h.stmt) });
-            assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLCancel(h.stmt) });
             let result = rx.recv_timeout(Duration::from_secs(5));
             worker.join().unwrap();
             assert_eq!(result.unwrap(), SQL_ERROR);
@@ -878,10 +1113,12 @@ mod tests {
             assert!(state.active_stmt.is_none());
             assert!(!state.client.as_ref().unwrap().is_connection_dead());
         }
-        assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLCancel(h.stmt) });
+        assert_eq!(SQL_SUCCESS_WITH_INFO, unsafe {
+            crate::api::SQLCancel(h.stmt)
+        });
         assert_eq!(
             stmt.inner.lock().unwrap().diag_records[0].sql_state,
-            *b"HY008"
+            *b"01S05"
         );
         assert_eq!(SQL_SUCCESS, unsafe {
             crate::api::SQLSetStmtAttrW(

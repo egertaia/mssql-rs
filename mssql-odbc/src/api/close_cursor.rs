@@ -7,6 +7,7 @@
 //! connection-level "busy" claim, allowing other statements on the same DBC
 //! to execute.
 
+use std::sync::MutexGuard;
 use tracing::{debug, error};
 
 use super::sqlstate::*;
@@ -14,7 +15,7 @@ use crate::api::odbc_types::{
     SQL_ERROR, SQL_INVALID_HANDLE, SQL_SUCCESS, SQL_SUCCESS_WITH_INFO, SqlHandle, SqlReturn,
 };
 use crate::error::free_errors;
-use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT};
+use crate::handles::stmt::{STMT_STATE_CURSOR_OPEN, STMT_STATE_EXEC_CONTEXT, StmtState};
 use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Closes the cursor on `statement_handle` and discards any pending rows.
@@ -131,10 +132,20 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
         Ok(operation) => operation,
         Err(rc) => return rc,
     };
-    let Ok(mut stmt_state) = stmt.inner.lock() else {
+    let Ok(stmt_state) = stmt.inner.lock() else {
         error!("SQLFreeStmt(SQL_CLOSE): stmt mutex poisoned");
         return SQL_ERROR;
     };
+    free_stmt_close_locked(statement_handle, stmt, stmt_state)
+}
+
+/// The caller retains an operation or cancellation guard through the drain.
+/// SQLCancel must not begin another operation while holding its cancellation fence.
+pub(super) fn free_stmt_close_locked(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    mut stmt_state: MutexGuard<'_, StmtState>,
+) -> SqlReturn {
     free_errors(&mut stmt_state);
     // No-op if cursor is already closed.
     if !stmt_state.has_state(STMT_STATE_CURSOR_OPEN) {

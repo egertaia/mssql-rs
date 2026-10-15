@@ -136,6 +136,17 @@ fn sql_col_attribute_w_safe(
     string_length_ptr: *mut SqlSmallInt,
     numeric_attribute_ptr: *mut SqlLen,
 ) -> SqlReturn {
+    // Cleared in a scope of its own, released before the DBC and ENV locks
+    // below, so a call that fails at one of them does not report a previous
+    // call's records.
+    {
+        let Ok(mut stmt_state) = stmt.inner.lock() else {
+            error!("SQLColAttributeW: stmt mutex poisoned");
+            return SQL_ERROR;
+        };
+        free_errors(&mut stmt_state);
+    }
+
     // Resolved before the stmt lock: the lookup takes the DBC lock first and
     // may need the session for a round trip.
     let alias = if matches!(
@@ -169,8 +180,6 @@ fn sql_col_attribute_w_safe(
         error!("SQLColAttributeW: stmt mutex poisoned");
         return SQL_ERROR;
     };
-
-    free_errors(&mut stmt_state);
 
     if !stmt_state.has_state(STMT_STATE_EXEC_CONTEXT) {
         post_diag(&mut stmt_state, ERR_FUNCTION_SEQUENCE);

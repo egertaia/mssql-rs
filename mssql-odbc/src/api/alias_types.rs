@@ -374,6 +374,7 @@ mod tests {
         SQL_DESC_LOCAL_TYPE_NAME, SQL_DESC_TYPE_NAME, SQL_ERROR, SQL_SUCCESS, SqlHandle,
         SqlPointer, SqlSmallInt, SqlUSmallInt,
     };
+    use crate::api::sqlstate::ERR_INVALID_DESCRIPTOR_INDEX;
     use crate::api::txn::release_dbc_client;
     use crate::handles::handle_from_raw;
     use crate::handles::stmt::STMT_STATE_EXEC_CONTEXT;
@@ -626,26 +627,44 @@ mod tests {
     fn a_poisoned_connection_fails_an_alias_columns_type_name() {
         let h = TestHandles::with_env_dbc_stmt();
         let dbc = dbc(&h);
+        let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
         describe_columns(&h, &[257]);
+        let type_name_rc = |col: SqlUSmallInt| {
+            let mut buf = [0u16; 16];
+            unsafe {
+                sql_col_attribute_w(
+                    h.stmt,
+                    col,
+                    SQL_DESC_TYPE_NAME,
+                    buf.as_mut_ptr() as SqlPointer,
+                    (buf.len() * 2) as SqlSmallInt,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            }
+        };
+        assert_eq!(type_name_rc(2), SQL_ERROR);
+        assert_eq!(
+            stmt.inner
+                .lock()
+                .unwrap()
+                .diag_records
+                .last()
+                .unwrap()
+                .sql_state,
+            ERR_INVALID_DESCRIPTOR_INDEX.state
+        );
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = dbc.inner.lock().unwrap();
             panic!("poison the dbc lock");
         }));
 
-        let mut buf = [0u16; 16];
-        let rc = unsafe {
-            sql_col_attribute_w(
-                h.stmt,
-                1,
-                SQL_DESC_TYPE_NAME,
-                buf.as_mut_ptr() as SqlPointer,
-                (buf.len() * 2) as SqlSmallInt,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
+        assert_eq!(type_name_rc(1), SQL_ERROR);
 
-        assert_eq!(rc, SQL_ERROR);
+        assert!(
+            stmt.inner.lock().unwrap().diag_records.is_empty(),
+            "the previous call's 07009 is not reported for this one"
+        );
         dbc.inner.clear_poison();
     }
 

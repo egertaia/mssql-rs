@@ -296,6 +296,18 @@ stages:
           set -euo pipefail
           python3 -m unittest discover -s .pipeline/scripts -p 'test_*.py' -v
         displayName: Test pipeline helper scripts
+      # Windows agents can omit Bash; enforce the executable benchmark regressions here.
+      - bash: |
+          set -euo pipefail
+          command -v bash
+          command -v git
+          python3 -m venv "$BENCHMARK_TEST_VENV"
+          "$BENCHMARK_TEST_VENV/bin/python" -m pip install --quiet pytest pyyaml
+          "$BENCHMARK_TEST_VENV/bin/python" -m pytest scripts/test_benchmark_pipeline.py -q -rs
+        displayName: Test benchmark pipeline scripts
+        env:
+          BENCHMARK_TEST_VENV: $(Agent.TempDirectory)/benchmark-tests
+          REQUIRE_BASH_TESTS: '1'
       - template: build-template-container.yml
         parameters:
           architecture: x64

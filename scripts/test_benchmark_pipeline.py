@@ -33,6 +33,8 @@ def named(steps, display_name):
 @pytest.fixture
 def run_script(tmp_path):
     if _BASH is None:
+        if os.environ.get("REQUIRE_BASH_TESTS") == "1":
+            pytest.fail("Bash is required for enforced benchmark regression tests")
         pytest.skip("Bash is required")
 
     def run(script, **env):
@@ -106,6 +108,15 @@ def test_checkout_and_fetch_precede_repository_execution(steps):
             assert f"$({macro})" not in script
         if step is not resolve:
             assert "git fetch" not in script
+
+
+@pytest.mark.parametrize("required", ["0", "1"])
+def test_missing_bash_policy(tmp_path, monkeypatch, required):
+    monkeypatch.setitem(run_script.__wrapped__.__globals__, "_BASH", None)
+    monkeypatch.setenv("REQUIRE_BASH_TESTS", required)
+    expected = pytest.fail.Exception if required == "1" else pytest.skip.Exception
+    with pytest.raises(expected, match="Bash is required"):
+        run_script.__wrapped__(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -231,5 +242,15 @@ def test_benchmark_tests_run_in_shared_validation():
     step = named(windows["steps"], "Unit test packaging scripts and pipeline configuration")
     command = next(line for line in step["pwsh"].splitlines() if "python -m pytest" in line)
     assert "scripts/test_benchmark_pipeline.py" in command.split()
+    assert step.get("condition", "succeeded()") == "succeeded()"
+    assert not step.get("continueOnError", False)
+
+    linux = next(job for job in build["jobs"] if job.get("job") == "Build_Linux")
+    step = named(linux["steps"], "Test benchmark pipeline scripts")
+    assert "set -euo pipefail" in step["bash"]
+    assert "command -v bash" in step["bash"]
+    assert "command -v git" in step["bash"]
+    assert "-m pytest scripts/test_benchmark_pipeline.py -q -rs" in step["bash"]
+    assert step["env"]["REQUIRE_BASH_TESTS"] == "1"
     assert step.get("condition", "succeeded()") == "succeeded()"
     assert not step.get("continueOnError", False)

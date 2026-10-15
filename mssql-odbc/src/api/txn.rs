@@ -23,14 +23,14 @@ use super::odbc_types::{
     SQL_TXN_REPEATABLE_READ, SQL_TXN_SERIALIZABLE, SQL_TXN_SS_SNAPSHOT, SqlReturn,
 };
 use super::sqlstate::{
-    ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_BUSY, ERR_CONNECTION_DOES_NOT_EXIST,
-    ERR_INVALID_ATTRIBUTE_VALUE, ERR_NO_ACTIVE_TDS_CLIENT, ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED,
-    SQLSTATE_08S01, SQLSTATE_01000, SQLSTATE_08007, SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED,
-    post_diag, post_tds_error,
+    ERR_ATTRIBUTE_CANNOT_BE_SET_NOW, ERR_CONNECTION_DOES_NOT_EXIST, ERR_INVALID_ATTRIBUTE_VALUE,
+    ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED, SQLSTATE_08S01, SQLSTATE_01000, SQLSTATE_08007,
+    SQLSTATE_HY000, WARN_TRANSACTION_COMMITTED, claim_error_diag, post_diag, post_tds_error,
 };
 use crate::error::{HasDiagnostics, free_errors, post_sql_error};
 use crate::handles::DbcHandle;
 use crate::handles::dbc::{ConnectionState, DbcState};
+use crate::handles::wire::{ClaimPolicy, LeaseReturn, WireLease, WireOwner};
 use crate::handles::{StmtHandle, handle_from_raw, process_is_shutting_down};
 
 /// Maps an ODBC `SQL_TXN_*` bit to the T-SQL clause msodbcsql emits for it
@@ -69,12 +69,10 @@ fn fail_cursor_close(dbc: &DbcHandle, op: &str) -> SqlReturn {
 /// Claims the connection's TDS client for a connection-scoped operation that no
 /// statement owns (commit, rollback, isolation change, autocommit change).
 ///
-/// Unlike [`super::exec_common::claim_connection`] there is no statement handle
-/// to attribute the claim to, so `active_stmt` is left alone; the caller must
-/// have closed every cursor first (see [`close_all_cursors`]) so the connection
-/// is genuinely idle. Returns `Err` with the diagnostic already posted to the
-/// DBC.
-pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, SqlReturn> {
+/// The caller must have closed every cursor first (see [`close_all_cursors`])
+/// so the connection is genuinely idle. Returns `Err` with the diagnostic
+/// already posted to the DBC.
+pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<WireLease, SqlReturn> {
     let Ok(mut state) = dbc.inner.lock() else {
         error!("{op}: dbc mutex poisoned");
         return Err(SQL_ERROR);
@@ -84,17 +82,17 @@ pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, S
         post_diag(&mut state, ERR_CONNECTION_DOES_NOT_EXIST);
         return Err(SQL_ERROR);
     }
-    if state.active_stmt.is_some() {
-        error!("{op}: connection is busy with results for another statement");
-        post_diag(&mut state, ERR_CONNECTION_BUSY);
-        return Err(SQL_ERROR);
+    match state
+        .wire
+        .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+    {
+        Ok(lease) => Ok(lease),
+        Err(claim_error) => {
+            error!(?claim_error, "{op}: connection is not available");
+            post_diag(&mut state, claim_error_diag(claim_error));
+            Err(SQL_ERROR)
+        }
     }
-    let Some(client) = state.client.take() else {
-        error!("{op}: no active TDS client");
-        post_diag(&mut state, ERR_NO_ACTIVE_TDS_CLIENT);
-        return Err(SQL_ERROR);
-    };
-    Ok(client)
 }
 
 /// Claims the connection's TDS client for an **internal** connection-scoped
@@ -108,24 +106,14 @@ pub(super) fn claim_dbc_client(dbc: &DbcHandle, op: &str) -> Result<TdsClient, S
 /// the `SQLGetInfo` that triggered it.
 ///
 /// Returns `None` — with no side effects and no diagnostic — when the DBC is
-/// not connected, a statement holds the connection, or the client is already
-/// claimed. On success the cached `USER_NAME()` entry is returned **with** the
-/// client, read under the same lock: the caller uses it as the value to report
-/// if the lookup yields nothing, and reading it separately would let a session
-/// change land in between and attach one session's principal to another.
-///
-/// The claim leaves `active_stmt` alone, because an internal query has no
-/// statement handle to attribute it to. A concurrent execution that lands in
-/// the in-flight window therefore passes
-/// [`super::exec_common::claim_connection`]'s busy check and reports
-/// `ERR_NO_ACTIVE_TDS_CLIENT` instead of `ERR_CONNECTION_BUSY`
-/// (`exec_common.rs:253-275`) — both `HY000`, so the difference is message
-/// quality, not contract. [`claim_dbc_client`] has the same window for commit,
-/// rollback, and isolation changes; closing it needs a connection-level claim
-/// marker that both would share.
-pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(TdsClient, u64, String)> {
+/// not connected or the wire is reserved or checked out. On success the cached
+/// `USER_NAME()` entry is returned **with** the lease, read under the same
+/// lock: the caller uses it as the value to report if the lookup yields
+/// nothing, and reading it separately would let a session change land in
+/// between and attach one session's principal to another.
+pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(WireLease, u64, String)> {
     let mut state = dbc.inner.lock().ok()?;
-    if state.connection_state != ConnectionState::Connected || state.active_stmt.is_some() {
+    if state.connection_state != ConnectionState::Connected {
         return None;
     }
     let generation = state.session_generation;
@@ -140,37 +128,24 @@ pub(super) fn try_claim_idle_dbc_client(dbc: &DbcHandle) -> Option<(TdsClient, u
     // the lookup would otherwise report the empty string for a connection that
     // answers normally on either side of it.
     let cache = state
-        .client
-        .as_ref()
+        .wire
+        .client()
         .map(super::get_info::collation_cache_inputs);
+    let lease = state
+        .wire
+        .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+        .ok()?;
     if let Some((code_page, char_set)) = cache {
         state.last_collation_code_page = code_page;
         state.last_char_set = char_set;
     }
-    state
-        .client
-        .take()
-        .map(|client| (client, generation, cached))
+    Some((lease, generation, cached))
 }
 
-/// Returns a client claimed by [`claim_dbc_client`] or
+/// Returns a lease claimed by [`claim_dbc_client`] or
 /// [`try_claim_idle_dbc_client`].
-///
-/// If the DBC mutex is poisoned the client cannot be stored and is dropped, so
-/// the connection is marked disconnected rather than left as `Connected` with
-/// `client == None`. That combination otherwise reads as "claimed, not known
-/// dead" to `SQL_ATTR_CONNECTION_DEAD`, and a pool would keep handing out a DBC
-/// on which every operation fails with `ERR_NO_ACTIVE_TDS_CLIENT`.
-pub(super) fn release_dbc_client(dbc: &DbcHandle, client: TdsClient) {
-    match dbc.inner.lock() {
-        Ok(mut state) => state.client = Some(client),
-        Err(mut poisoned) => {
-            error!("release_dbc_client: dbc mutex poisoned; marking DBC disconnected");
-            // The lock guard is still reachable through the poison error, so the
-            // state can be corrected even though the mutex is poisoned.
-            poisoned.get_mut().connection_state = ConnectionState::Disconnected;
-        }
-    }
+pub(super) fn release_dbc_client(dbc: &DbcHandle, client: WireLease) {
+    dbc.return_lease(client, LeaseReturn::Release);
 }
 
 /// Runs `sql` as a language batch on an already-claimed client and drains the
@@ -252,7 +227,7 @@ pub(super) fn end_transaction(dbc: &DbcHandle, commit: bool, op: &str) -> SqlRet
     // connection cursor-closed on the strength of that. The combination is
     // reachable in plain autocommit mode: nothing there ever sets
     // `local_tran_started`, and no other path sweeps, so a cursor left open
-    // across `SQLEndTran` would keep `active_stmt` claimed behind the DM's back
+    // across `SQLEndTran` would keep the wire reserved behind the DM's back
     // and lock out every other statement on the connection.
     //
     // msodbcsql returns before its own sweep here (`sqlctran.cpp:293` precedes
@@ -507,7 +482,7 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
     // D4: read the transaction flag *before* claiming the client. Every other
     // claim site in this file does the same, and the ordering matters: if this
     // lock were taken after the claim and turned out to be poisoned, the early
-    // return would drop the owned client, leaving `state.client == None` while
+    // return would drop the owned lease, leaving the wire checked out while
     // `connection_state` is still `Connected` — which the cached liveness read
     // interprets as "busy but healthy", so the pool would keep handing out a
     // connection that can never serve a request again.
@@ -550,8 +525,8 @@ pub(super) fn reset_connection(dbc: &DbcHandle, value: u64) -> SqlReturn {
         return fail_cursor_close(dbc, OP);
     }
 
-    // Claim the idle client: this rejects a busy connection (open cursor /
-    // `active_stmt`) with ERR_CONNECTION_BUSY and a disconnected DBC with
+    // Claim the idle client: this rejects a busy connection (a reserved or
+    // checked-out wire) with ERR_CONNECTION_BUSY and a disconnected DBC with
     // ERR_CONNECTION_DOES_NOT_EXIST (08003, D7). From here until
     // `release_dbc_client` the DBC mutex is never taken again.
     let mut client = match claim_dbc_client(dbc, OP) {
@@ -873,12 +848,16 @@ fn rollback_before_disconnect_inner(dbc: &DbcHandle, process_is_shutting_down: b
     }
 
     let client = match dbc.inner.lock() {
-        Ok(mut state) => state.client.take(),
+        Ok(mut state) => state
+            .wire
+            .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+            .ok(),
         Err(_) => {
             error!("{OP}: dbc mutex poisoned");
             return;
         }
     };
+    // If another thread holds the wire, the server rolls back on disconnect.
     let Some(mut client) = client else {
         return;
     };
@@ -1199,15 +1178,19 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![]));
-            state.active_stmt = Some(std::ptr::dangling_mut::<c_void>());
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![]));
+            state
+                .wire
+                .set_owner_for_test(Some(std::ptr::dangling_mut::<c_void>()));
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_ERROR);
         let state = dbc.inner.lock().unwrap();
         assert_eq!(state.diag_records()[0].sql_state, SQLSTATE_HY000);
         // The busy connection was rejected without taking the client.
-        assert!(state.client.is_some());
+        assert!(state.wire.client().is_some());
     }
 
     #[test]
@@ -1225,7 +1208,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 env_change_reset_connection(),
                 done_no_more(),
             ]));
@@ -1235,7 +1218,7 @@ mod tests {
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
         let state = dbc.inner.lock().unwrap();
         assert!(!state.local_tran_started);
-        let client = state.client.as_ref().expect("client restored after reset");
+        let client = state.wire.client().expect("client restored after reset");
         assert!(
             !client.is_connection_dead(),
             "a reset that was acknowledged must leave the connection reusable"
@@ -1278,14 +1261,14 @@ mod tests {
                 client.has_active_transaction(),
                 "precondition: the client must start with a live transaction"
             );
-            state.client = Some(client);
+            state.wire.put_client_for_test(client);
             state.local_tran_started = true;
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
         let state = dbc.inner.lock().unwrap();
         assert!(!state.local_tran_started);
-        let client = state.client.as_ref().expect("client restored after reset");
+        let client = state.wire.client().expect("client restored after reset");
         assert!(
             !client.has_active_transaction(),
             "the live transaction must be rolled back before the reset"
@@ -1323,7 +1306,7 @@ mod tests {
                 0xDEAD_BEEF,
             );
             assert!(client.has_active_transaction());
-            state.client = Some(client);
+            state.wire.put_client_for_test(client);
             // The driver-begun transaction carries no user work.
             state.local_tran_started = false;
         }
@@ -1331,7 +1314,7 @@ mod tests {
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
         {
             let state = dbc.inner.lock().unwrap();
-            let client = state.client.as_ref().expect("client restored after arming");
+            let client = state.wire.client().expect("client restored after arming");
             assert!(
                 !client.has_active_transaction(),
                 "arming a full reset must drop the transaction the reset discards"
@@ -1344,7 +1327,7 @@ mod tests {
             SQL_SUCCESS
         );
         let state = dbc.inner.lock().unwrap();
-        let client = state.client.as_ref().expect("client restored");
+        let client = state.wire.client().expect("client restored");
         assert!(
             !client.reset_pending(),
             "the SET must have carried the bit and collected the acknowledgement"
@@ -1369,7 +1352,9 @@ mod tests {
         {
             let mut state = dbc.inner.lock().unwrap();
             // No tokens: the rollback round trip runs dry and fails.
-            state.client = Some(tds_client_from_tokens_in_transaction(vec![], 0xDEAD_BEEF));
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens_in_transaction(vec![], 0xDEAD_BEEF));
             state.local_tran_started = true;
             state.database_user_name = Some(crate::handles::dbc::CachedDatabaseUserName {
                 catalog: "master".to_string(),
@@ -1421,21 +1406,21 @@ mod tests {
             stmt.inner.lock().unwrap().set_state(STMT_STATE_CURSOR_OPEN);
 
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 // Drained by the cursor sweep.
                 done_no_more(),
                 // Collected later by the request that carries the reset bit.
                 env_change_reset_connection(),
                 done_no_more(),
             ]));
-            state.active_stmt = Some(h.stmt);
+            state.wire.set_owner_for_test(Some(h.stmt));
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
         let state = dbc.inner.lock().unwrap();
         assert!(state.diag_records().is_empty());
         assert!(
-            state.active_stmt.is_none(),
+            state.wire.statement_owner().is_none(),
             "the sweep must release the cursor claim"
         );
         assert!(state.server_isolation_unknown);
@@ -1456,7 +1441,9 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![]));
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![]));
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
@@ -1466,7 +1453,7 @@ mod tests {
             state.server_isolation_unknown,
             "the reset leaves the server's isolation level unknown, so the checkout SET must emit"
         );
-        let client = state.client.as_ref().expect("client restored after arming");
+        let client = state.wire.client().expect("client restored after arming");
         assert!(
             client.reset_pending(),
             "the acknowledgement is outstanding until the carrying request completes"
@@ -1494,7 +1481,9 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![]));
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![]));
             state.database_user_name = Some(CachedDatabaseUserName {
                 catalog: "master".to_string(),
                 database_change_count: 0,
@@ -1529,7 +1518,9 @@ mod tests {
         {
             let mut state = dbc.inner.lock().unwrap();
             // The batch completes, but with no ResetConnection acknowledgement.
-            state.client = Some(tds_client_from_tokens(vec![done_no_more()]));
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![done_no_more()]));
         }
 
         assert_eq!(reset_connection(dbc, 1), SQL_SUCCESS);
@@ -1545,7 +1536,7 @@ mod tests {
             state.server_isolation_unknown,
             "the SET never took effect, so the server's isolation level is still unknown"
         );
-        let client = state.client.as_ref().expect("client restored for teardown");
+        let client = state.wire.client().expect("client restored for teardown");
         assert!(
             client.is_connection_dead(),
             "an unacknowledged reset must poison the client so the pool discards it"
@@ -1569,7 +1560,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 env_change_reset_connection(),
                 done_no_more(),
             ]));
@@ -1589,7 +1580,7 @@ mod tests {
             !state.server_isolation_unknown,
             "the SET reached the server, so the cache and the session agree again"
         );
-        let client = state.client.as_ref().expect("client restored");
+        let client = state.wire.client().expect("client restored");
         assert!(
             !client.reset_pending(),
             "the SET must have emitted and collected the reset acknowledgement"
@@ -1651,7 +1642,9 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         let before = {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![]));
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(vec![]));
             state.reset_generation
         };
 
@@ -1681,7 +1674,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 // SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
                 done_no_more(),
                 // reset round trip
@@ -1708,7 +1701,7 @@ mod tests {
             "checkout must re-apply READ COMMITTED after the reset"
         );
         assert!(
-            !state.client.as_ref().unwrap().is_connection_dead(),
+            !state.wire.client().unwrap().is_connection_dead(),
             "the connection stays reusable across reset + isolation re-apply"
         );
         assert!(state.diag_records().is_empty());
@@ -1732,7 +1725,7 @@ mod tests {
         let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
         {
             let mut state = dbc.inner.lock().unwrap();
-            state.client = Some(tds_client_from_tokens(vec![
+            state.wire.put_client_for_test(tds_client_from_tokens(vec![
                 // acquire: reset round trip
                 env_change_reset_connection(),
                 done_no_more(),
@@ -1760,8 +1753,8 @@ mod tests {
 
         let state = dbc.inner.lock().unwrap();
         let client = state
-            .client
-            .as_ref()
+            .wire
+            .client()
             .expect("same client reused across cycle");
         assert!(!client.is_connection_dead());
         assert!(state.diag_records().is_empty());
@@ -1791,10 +1784,12 @@ mod tests {
             // Queued so a rollback that *is* sent completes and clears the
             // transaction. That is what makes "still active" below evidence of
             // a skip rather than of a round-trip that merely failed.
-            state.client = Some(tds_client_from_tokens_in_transaction(
-                vec![env_change_rollback_transaction(), done_no_more()],
-                1,
-            ));
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens_in_transaction(
+                    vec![env_change_rollback_transaction(), done_no_more()],
+                    1,
+                ));
             state.local_tran_started = true;
         }
 
@@ -1802,8 +1797,8 @@ mod tests {
 
         let state = dbc.inner.lock().unwrap();
         let client = state
-            .client
-            .as_ref()
+            .wire
+            .client()
             .expect("the client must be handed back so teardown stays consistent");
         assert!(
             client.has_active_transaction(),
@@ -1813,5 +1808,62 @@ mod tests {
             state.diag_records().is_empty(),
             "this path is best-effort and must post no diagnostic"
         );
+    }
+
+    /// AB#49225: an execute while a connection-scoped operation holds the
+    /// client must get the busy error.
+    #[test]
+    fn a_connection_operation_in_flight_reports_busy_to_an_execute() {
+        use crate::api::exec_common::{claim_connection, return_client_idle};
+        use crate::api::sqlstate::ERR_CONNECTION_BUSY;
+        use crate::handles::wire::WireLease;
+        use crate::test_support::TestHandles;
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        type Claim = fn(&DbcHandle) -> WireLease;
+        let claims: [(&str, Claim); 2] = [
+            ("SQLEndTran", |dbc| {
+                claim_dbc_client(dbc, "SQLEndTran").unwrap()
+            }),
+            ("SQL_USER_NAME lookup", |dbc| {
+                try_claim_idle_dbc_client(dbc).unwrap().0
+            }),
+        ];
+        for (name, claim) in claims {
+            let h = TestHandles::with_env_dbc_stmt();
+            h.mark_dbc_connected();
+            let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            dbc.inner
+                .lock()
+                .unwrap()
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+
+            let lease = claim(dbc);
+            assert!(
+                matches!(
+                    claim_connection(dbc, stmt, h.stmt, "SQLExecDirectW"),
+                    Err(SQL_ERROR)
+                ),
+                "{name}"
+            );
+            {
+                let ss = stmt.inner.lock().unwrap();
+                assert_eq!(ss.diag_records.len(), 1, "{name}");
+                assert!(
+                    ss.diag_records[0]
+                        .message
+                        .ends_with(ERR_CONNECTION_BUSY.text),
+                    "{name}: {}",
+                    ss.diag_records[0].message
+                );
+            }
+
+            release_dbc_client(dbc, lease);
+            let lease = claim_connection(dbc, stmt, h.stmt, "SQLExecDirectW")
+                .unwrap_or_else(|_| panic!("{name}: the released wire must be claimable"));
+            return_client_idle(dbc, h.stmt, lease);
+        }
     }
 }

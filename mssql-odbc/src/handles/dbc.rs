@@ -4,9 +4,10 @@
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use mssql_tds::connection::tds_client::TdsClient;
+use tracing::error;
 
 use super::env::SharedRuntime;
+use super::wire::{ConnectionWire, LeaseReturn, WireLease};
 use super::{EnvHandle, HandleType, HasObjectType};
 use crate::api::odbc_types::{DEFAULT_PACKET_SIZE, SQL_MODE_READ_WRITE, SQL_TXN_READ_COMMITTED};
 use crate::conversion::client_encoding::ClientEncoding;
@@ -96,13 +97,9 @@ pub(crate) struct DbcState {
     /// (`SQLFreeHandle(SQL_HANDLE_DESC)`) resets every statement referencing
     /// it back to its own implicit descriptor first.
     pub(crate) descriptors: Vec<*mut c_void>,
-    /// The STMT handle that currently has an open cursor, if any.
-    /// Set when SQLExecDirect succeeds; cleared by SQLCloseCursor /
-    /// SQLFreeStmt(SQL_CLOSE). Used to enforce the non-MARS rule that only
-    /// one statement may hold an open cursor per connection at a time.
-    pub(crate) active_stmt: Option<*mut c_void>,
-    /// Active TDS connection, present only when `connection_state == Connected`.
-    pub(crate) client: Option<TdsClient>,
+    /// The TDS client and who owns it. Installed only while
+    /// `connection_state == Connected`.
+    pub(crate) wire: ConnectionWire,
     /// Pre-connect access token set via `SQL_COPT_SS_ACCESS_TOKEN`.
     /// Consumed by `SQLDriverConnect` to select `AccessToken` authentication.
     pub(crate) access_token: Option<String>,
@@ -254,7 +251,7 @@ pub(crate) struct DbcState {
     /// Last-known database code page for `SQL_COLLATION_SEQ`, refreshed each
     /// time an execution claims the client. Answers `SQLGetInfo` while a
     /// data-at-execution sequence has moved the client onto a statement
-    /// (`SQL_NEED_DATA`), when [`client`](Self::client) is `None` but the DBC is
+    /// (`SQL_NEED_DATA`), when the wire has no parked client but the DBC is
     /// still connected. A plain code page, so the common path caches without
     /// allocating. Cleared on disconnect.
     pub(crate) last_collation_code_page: Option<u16>,
@@ -328,8 +325,7 @@ impl std::fmt::Debug for DbcState {
             .field("connection_state", &self.connection_state)
             .field("statements", &self.statements)
             .field("descriptors", &self.descriptors)
-            .field("active_stmt", &self.active_stmt)
-            .field("client", &self.client)
+            .field("wire", &self.wire)
             .field(
                 "access_token",
                 &self.access_token.as_ref().map(|_| "<REDACTED>"),
@@ -368,8 +364,7 @@ impl DbcHandle {
                 connection_state: ConnectionState::Disconnected,
                 statements: Vec::new(),
                 descriptors: Vec::new(),
-                active_stmt: None,
-                client: None,
+                wire: ConnectionWire::default(),
                 access_token: None,
                 vendor_overrides: VendorConnOverrides::default(),
                 effective_vendor_settings: None,
@@ -407,6 +402,16 @@ impl DbcHandle {
         // and the ENV outlives this DBC per the DM contract.
         unsafe { &*(self.parent_env as *const EnvHandle) }
     }
+
+    /// Returns `false`, closing the lease's client, on a poisoned mutex.
+    pub(crate) fn return_lease(&self, lease: WireLease, how: LeaseReturn) -> bool {
+        let Ok(mut state) = self.inner.lock() else {
+            error!(owner = ?lease.owner(), "dbc mutex poisoned returning a wire lease");
+            return false;
+        };
+        state.wire.restore(lease, how);
+        true
+    }
 }
 
 impl HasObjectType for DbcHandle {
@@ -436,5 +441,33 @@ mod tests {
         assert!(rendered.contains("<REDACTED>"));
         assert!(rendered.contains("current_catalog: Some(\"reporting\")"));
         assert!(rendered.contains("stmt_query_timeout: 30"));
+    }
+
+    #[test]
+    fn return_lease_reports_a_poisoned_mutex() {
+        use super::super::wire::{ClaimPolicy, WireOwner};
+        use mssql_tds::test_client_support::tds_client_from_tokens;
+
+        let h = TestHandles::with_env_dbc();
+        h.mark_dbc_connected();
+        let dbc = unsafe { handle_from_raw::<DbcHandle>(h.dbc) };
+        let lease = {
+            let mut state = dbc.inner.lock().unwrap();
+            state
+                .wire
+                .put_client_for_test(tds_client_from_tokens(Vec::new()));
+            state
+                .wire
+                .claim(WireOwner::Connection, ClaimPolicy::IdleOnly)
+                .unwrap()
+        };
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = dbc.inner.lock().unwrap();
+            panic!("poison the dbc lock");
+        });
+
+        assert!(!dbc.return_lease(lease, LeaseReturn::Release));
+        // Only so `TestHandles` can tear the DBC down.
+        dbc.inner.clear_poison();
     }
 }

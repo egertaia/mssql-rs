@@ -402,7 +402,11 @@ pub fn text(report: &Report) -> String {
             let _ = write!(out, "; database {}", r.name(Category::Database, database));
         }
         if request.trust_server_certificate {
-            out.push_str("; server certificate trusted (-C)");
+            out.push_str(if request.encrypt == super::Encrypt::Strict {
+                "; -C ignored (strict encryption validates the certificate)"
+            } else {
+                "; server certificate trusted (-C)"
+            });
         }
         if let Some(name) = &request.host_name_in_certificate {
             let _ = write!(

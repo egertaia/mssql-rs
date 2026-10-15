@@ -89,23 +89,29 @@ pub(crate) async fn get_instance_info_ext(
     ssrp_port: u16,
     timeout_ms: u64,
 ) -> TdsResult<Vec<SsrpInstanceInfo>> {
-    query_instance(server, instance, ssrp_port, timeout_ms, |_| {})
+    query_instance(server, instance, ssrp_port, timeout_ms, false, |_| {})
         .await
         .map_err(Error::from)
 }
 
 /// Asks SQL Server Browser on `server` (at `ssrp_port`) for the endpoints of
 /// the named `instance`, waiting `timeout_ms` for the answer once `server`
-/// is resolved. `on_resolved` is given the addresses asked, once resolved.
+/// is resolved. With `bound_resolution`, `timeout_ms` instead bounds the whole
+/// lookup, resolving `server` included, and a resolver that runs out of time is
+/// [`SsrpLookupError::TimedOut`]. `on_resolved` is given the addresses asked,
+/// once resolved.
 pub(crate) async fn query_instance(
     server: &str,
     instance: &str,
     ssrp_port: u16,
     timeout_ms: u64,
+    bound_resolution: bool,
     on_resolved: impl FnOnce(&[SocketAddr]),
 ) -> Result<Vec<SsrpInstanceInfo>, SsrpLookupError> {
     let resolve = tokio::net::lookup_host((server, ssrp_port));
-    query_browser(server, instance, resolve, timeout_ms, None, on_resolved)
+    let deadline =
+        bound_resolution.then(|| tokio::time::Instant::now() + Duration::from_millis(timeout_ms));
+    query_browser(server, instance, resolve, timeout_ms, deadline, on_resolved)
         .await
         .map(|response| response.protocols)
 }
@@ -786,6 +792,35 @@ mod tests {
             "unexpected error: {}",
             msg
         );
+    }
+
+    /// With `bound_resolution` the production lookup shares one limit between
+    /// resolving and the Browser, and a silent Browser is still no answer.
+    #[tokio::test]
+    async fn a_bounded_lookup_still_reaches_the_browser() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            let (_, addr) = socket.recv_from(&mut buf).await.unwrap();
+            let payload = "ServerName;MOCK;InstanceName;I;IsClustered;No;Version;16.0;tcp;4242;;";
+            let mut resp = vec![SVR_RESP];
+            resp.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            resp.extend_from_slice(payload.as_bytes());
+            socket.send_to(&resp, addr).await.unwrap();
+        });
+
+        let info = query_instance("127.0.0.1", "I", port, 2000, true, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(info[0].tcp_port, Some(4242));
+
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        let error = query_instance("127.0.0.1", "I", silent_port, 200, true, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "noAnswer", "{error}");
     }
 
     /// Resolves to `address` after `delay`, as a slow DNS server would.

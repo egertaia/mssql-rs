@@ -616,7 +616,7 @@ impl ParsedDataSource {
     }
 
     /// Get the local computer name
-    fn get_computer_name() -> Option<String> {
+    pub(crate) fn get_computer_name() -> Option<String> {
         hostname::get()
             .ok()
             .and_then(|name| name.into_string().ok())

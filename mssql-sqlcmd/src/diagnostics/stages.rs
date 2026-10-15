@@ -175,8 +175,10 @@ impl StageRecorder {
 
     /// The stages recorded so far, in the order they ended, which is the order
     /// they ran in (login, which contains the TLS handshake when encryption
-    /// starts at login, follows it). A stage that contains another is timed
-    /// without it.
+    /// starts at login, follows it). A login is timed without its TLS
+    /// handshake. No other stage is: the connects to the other addresses run
+    /// alongside the attempt, so one that is slow can span stages that are not
+    /// its own.
     pub fn steps(&self) -> Vec<Step> {
         let mut recorded = self
             .steps
@@ -185,18 +187,16 @@ impl StageRecorder {
             .unwrap_or_default();
         recorded.sort_by_key(|(sequence, step)| (step.ended, *sequence));
         let mut steps: Vec<Step> = recorded.into_iter().map(|(_, step)| step).collect();
-        let intervals: Vec<(Instant, Instant)> = steps
+        let handshakes: Vec<(Instant, Instant)> = steps
             .iter()
+            .filter(|step| step.stage == Stage::Tls)
             .map(|step| (step.started, step.ended))
             .collect();
-        for (index, step) in steps.iter_mut().enumerate() {
-            let nested: u128 = intervals
+        for step in steps.iter_mut().filter(|step| step.stage == Stage::Login) {
+            let nested: u128 = handshakes
                 .iter()
-                .enumerate()
-                .filter(|(other, (start, end))| {
-                    *other != index && *start >= step.started && *end <= step.ended
-                })
-                .map(|(_, (start, end))| end.saturating_duration_since(*start).as_millis())
+                .filter(|(start, end)| *start >= step.started && *end <= step.ended)
+                .map(|(start, end)| end.saturating_duration_since(*start).as_millis())
                 .sum();
             step.duration_ms = step
                 .duration_ms
@@ -462,6 +462,49 @@ mod tests {
         assert!(
             login.duration_ms < 30,
             "login without tls took {} ms",
+            login.duration_ms
+        );
+    }
+
+    /// A slow connect to another address spans the whole attempt's stages,
+    /// which are not its own: it keeps its elapsed time, and the TLS
+    /// handshake is taken from the login only once.
+    #[test]
+    fn a_slow_probe_keeps_its_time_and_tls_is_not_counted_twice() {
+        let steps = record(|| {
+            let probe = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TCP,
+                address = "10.0.0.2",
+                ok = tracing::field::Empty
+            );
+            let login = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::LOGIN,
+                ok = tracing::field::Empty
+            );
+            let tls = tracing::info_span!(
+                target: connect_stage::TARGET,
+                connect_stage::TLS,
+                ok = tracing::field::Empty
+            );
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            tls.record(connect_stage::OK, true);
+            drop(tls);
+            login.record(connect_stage::OK, true);
+            drop(login);
+            probe.record(connect_stage::OK, true);
+        });
+        let probe = steps.iter().find(|s| s.stage == Stage::Tcp).unwrap();
+        let login = steps.iter().find(|s| s.stage == Stage::Login).unwrap();
+        assert!(
+            probe.duration_ms >= 60,
+            "probe took {} ms",
+            probe.duration_ms
+        );
+        assert!(
+            login.duration_ms < 30,
+            "login took {} ms",
             login.duration_ms
         );
     }

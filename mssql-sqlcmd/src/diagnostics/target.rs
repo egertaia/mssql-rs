@@ -10,9 +10,8 @@
 //! Parsing makes no external call and does not decide whether a connection can
 //! succeed.
 
+use std::borrow::Cow;
 use std::fmt;
-
-/// The transport the server string selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
     /// No prefix: the client's protocol order. On Windows it tries shared
@@ -55,13 +54,33 @@ pub struct Target {
 }
 
 impl Target {
-    /// The name to resolve: `.` and `(local)` are this machine.
-    pub fn resolvable_host(&self) -> &str {
-        if self.host == "." || self.host.eq_ignore_ascii_case("(local)") {
-            "localhost"
-        } else {
-            &self.host
+    /// The name the client resolves, as it decides when it parses the server:
+    /// `.`, `(local)`, `localhost` and this computer's name are this machine,
+    /// which over TCP, to the dedicated administrator port or with an
+    /// instance is `localhost`, and otherwise is the computer's own name.
+    /// Explicit IP addresses are left as given.
+    pub fn resolvable_host(&self) -> Cow<'_, str> {
+        if !self.is_local_name() {
+            return Cow::Borrowed(&self.host);
         }
+        if matches!(self.protocol, Protocol::Tcp | Protocol::Admin) || self.instance.is_some() {
+            return Cow::Borrowed("localhost");
+        }
+        match mssql_tds::connection::this_computer_name() {
+            Some(name) => Cow::Owned(name),
+            None => Cow::Borrowed(&self.host),
+        }
+    }
+
+    /// Whether the host is one of the names for this machine, but not an
+    /// address.
+    fn is_local_name(&self) -> bool {
+        let host = self.host.as_str();
+        host == "."
+            || host.eq_ignore_ascii_case("(local)")
+            || host.eq_ignore_ascii_case("localhost")
+            || mssql_tds::connection::this_computer_name()
+                .is_some_and(|name| host.eq_ignore_ascii_case(&name))
     }
 
     /// Whether the port must come from SQL Server Browser: a named instance
@@ -74,11 +93,7 @@ impl Target {
     /// tries shared memory first: `.`, `(local)`, `localhost`, a loopback
     /// address, or this computer's name.
     pub fn is_local(&self) -> bool {
-        let host = self.host.as_str();
-        matches!(host, "." | "127.0.0.1" | "::1")
-            || host.eq_ignore_ascii_case("(local)")
-            || host.eq_ignore_ascii_case("localhost")
-            || std::env::var("COMPUTERNAME").is_ok_and(|name| host.eq_ignore_ascii_case(&name))
+        matches!(self.host.as_str(), "127.0.0.1" | "::1") || self.is_local_name()
     }
 }
 
@@ -234,9 +249,15 @@ pub fn parse(server: &str) -> Result<Target, ParseError> {
         Some((host, instance)) => {
             let instance = instance.trim();
             if instance.is_empty() {
-                return Err(ParseError::MissingInstance);
+                // The port decides over the instance, so an empty one is not
+                // an error then (`tcp:db01\,1433`), as for the client.
+                if port.is_none() {
+                    return Err(ParseError::MissingInstance);
+                }
+                (host.trim(), None)
+            } else {
+                (host.trim(), Some(instance.to_string()))
             }
-            (host.trim(), Some(instance.to_string()))
         }
         None => (rest.trim(), None),
     };
@@ -511,9 +532,48 @@ mod tests {
     }
 
     #[test]
-    fn this_machine_resolves_as_localhost() {
-        assert_eq!(parse(".").unwrap().resolvable_host(), "localhost");
-        assert_eq!(parse("(local)").unwrap().resolvable_host(), "localhost");
-        assert_eq!(parse("db01").unwrap().resolvable_host(), "db01");
+    fn this_machine_resolves_as_the_client_resolves_it() {
+        let computer = mssql_tds::connection::this_computer_name();
+        let over_tcp = |server: &str| parse(server).unwrap().resolvable_host().into_owned();
+        assert_eq!(over_tcp("tcp:."), "localhost");
+        assert_eq!(over_tcp("tcp:(local)"), "localhost");
+        assert_eq!(over_tcp("admin:localhost"), "localhost");
+        assert_eq!(over_tcp("db01"), "db01");
+        // An address is left as given, never read as a name for this machine.
+        assert_eq!(over_tcp("tcp:127.0.0.1,1433"), "127.0.0.1");
+        assert_eq!(over_tcp("::1"), "::1");
+        if let Some(computer) = computer {
+            // Over TCP, or with an instance, this computer's name is localhost;
+            // otherwise the client keeps the name.
+            assert_eq!(over_tcp(&format!("tcp:{computer},1433")), "localhost");
+            assert_eq!(over_tcp(&format!("{computer}\\SQL2022")), "localhost");
+            assert_eq!(over_tcp(&computer), computer);
+            assert_eq!(over_tcp("."), computer);
+        }
+    }
+
+    /// The client reads this computer's name from the operating system, not
+    /// from an environment variable that may be unset.
+    #[test]
+    fn this_computers_name_is_local_without_an_environment_variable() {
+        let Some(computer) = mssql_tds::connection::this_computer_name() else {
+            return;
+        };
+        for host in [computer.clone(), computer.to_uppercase()] {
+            assert!(parse(&host).unwrap().is_local(), "{host}");
+        }
+    }
+
+    #[test]
+    fn an_empty_instance_is_accepted_when_a_port_decides() {
+        assert_eq!(
+            parse("tcp:db01\\,1433"),
+            Ok(target(Protocol::Tcp, "db01", None, Some(1433)))
+        );
+        assert_eq!(
+            parse("db01\\,1433"),
+            Ok(target(Protocol::Default, "db01", None, Some(1433)))
+        );
+        assert_eq!(parse("tcp:db01\\"), Err(ParseError::MissingInstance));
     }
 }

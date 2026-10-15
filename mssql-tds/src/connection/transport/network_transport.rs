@@ -203,9 +203,9 @@ async fn create_base_stream(
     match transport_context {
         TransportContext::Tcp { host, port, .. } => {
             if multi_subnet_failover {
-                // Resolving is part of the parallel connect.
-                probe.check_stop(DiagnosticStop::Resolution)?;
-                // Use parallel connection mode for MultiSubnetFailover
+                // Resolving is part of the parallel connect; a diagnostic
+                // attempt cannot stop between the two, which
+                // `diagnose_client` refuses up front.
                 create_base_stream_parallel(
                     host,
                     *port,
@@ -464,7 +464,8 @@ async fn connect_tcp_socket(
 
 /// For a diagnostic connection: connects to `address`, an address after the
 /// one the connection uses, in a task of its own, and closes the connection
-/// at once. The probe keeps the task, to wait for it.
+/// at once. It has `connect_timeout_ms`, what is left of the connection's own
+/// limit. The probe keeps the task, to wait for it.
 fn spawn_extra_attempt(
     address: SocketAddr,
     keep_alive_in_ms: u32,
@@ -541,6 +542,9 @@ async fn create_base_stream_sequential(
     if !socket_addresses.is_empty() {
         probe.check_stop(DiagnosticStop::Resolution)?;
     }
+    // The connects, those to the addresses after the one used too, share this
+    // one limit.
+    let connect_deadline = tokio::time::Instant::now() + Duration::from_millis(connect_timeout_ms);
 
     let mut remaining = socket_addresses.into_iter();
     for socket_address in remaining.by_ref() {
@@ -584,12 +588,18 @@ async fn create_base_stream_sequential(
     // We don't have a valid TCP stream, so we need to return the last error.
     if let Some(stream) = tcp_stream {
         if probe.all_addresses() {
+            let remaining_ms = u64::try_from(
+                connect_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
             for address in remaining {
                 spawn_extra_attempt(
                     address,
                     keep_alive_in_ms,
                     keep_alive_interval_in_ms,
-                    connect_timeout_ms,
+                    remaining_ms,
                     probe,
                 );
             }

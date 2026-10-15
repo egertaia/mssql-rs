@@ -86,7 +86,7 @@ impl SspiAuthHandler {
     /// if the security context could not be created.
     pub(crate) fn new(config: &IntegratedAuthConfig, server: &str, port: u16) -> TdsResult<Self> {
         let security_context = create_security_context(config, server, port)?;
-        let target_spn = security_context.spn().to_string();
+        let target_spn = security_context.imported_name().to_string();
 
         Ok(Self {
             security_context,

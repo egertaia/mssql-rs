@@ -8,6 +8,7 @@
 //! - [`client_context::ClientContext`] — connection configuration (credentials, encryption, timeouts)
 //! - [`bulk_copy::BulkCopy`] — bulk data loading
 
+pub(crate) mod blocking;
 pub mod bulk_copy;
 pub(crate) mod bulk_copy_state;
 /// Client connection context and authentication factories.
@@ -26,3 +27,9 @@ pub(crate) mod session_recovery;
 pub mod tds_client;
 /// Transport layer (TCP, Named Pipes, Shared Memory).
 pub mod transport;
+
+/// This computer's name, as the client compares a data source's host with it
+/// to decide whether the data source is local.
+pub fn this_computer_name() -> Option<String> {
+    datasource_parser::ParsedDataSource::get_computer_name()
+}

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::connection::blocking::off_runtime_thread;
 use crate::connection::client_context::{ClientContext, TransportContext};
 use crate::connection::connect_stage;
 use crate::connection::session_recovery::SessionRecoveryData;
@@ -762,10 +763,16 @@ impl LoginHandler<'_> {
                 server, port
             );
 
-            let mut handler = SspiAuthHandler::new(&config, &server, port)?;
+            let handler =
+                off_runtime_thread(move || SspiAuthHandler::new(&config, &server, port)).await?;
             self.login_stage
                 .record(connect_stage::SPN, handler.target_spn());
-            let initial_token = handler.get_initial_token()?;
+            let (handler, initial_token) = off_runtime_thread(move || {
+                let mut handler = handler;
+                let token = handler.get_initial_token()?;
+                Ok((handler, token))
+            })
+            .await?;
 
             debug!(
                 "Generated initial SSPI token ({} bytes) using {}",

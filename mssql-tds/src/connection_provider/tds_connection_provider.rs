@@ -87,8 +87,30 @@ struct ProbeState {
     options: DiagnosticProbe,
     /// Where the attempt stopped.
     stopped: Mutex<Option<DiagnosticStop>>,
-    /// The connects to the addresses after the one used.
-    extra_attempts: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The connects to the addresses after the one used. Owned so that
+    /// dropping the probe, as canceling the attempt does, aborts them.
+    extra_attempts: Arc<Mutex<Vec<AbortOnDrop>>>,
+}
+
+/// A task that is aborted when this is dropped, unlike a `JoinHandle`, which
+/// leaves the task running.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl std::future::Future for AbortOnDrop {
+    type Output = Result<(), tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
 }
 
 /// The probe of every normal connection: it asks nothing.
@@ -153,7 +175,7 @@ impl ConnectProbe {
                 .extra_attempts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(attempt);
+                .push(AbortOnDrop(attempt));
         }
     }
 
@@ -167,12 +189,13 @@ impl ConnectProbe {
     }
 
     /// Waits for the connects to the other addresses, at most `bound_ms`
-    /// (0: no bound); those still running then are aborted.
+    /// (0: no bound); those still running then are aborted, as they are if
+    /// this is dropped while waiting.
     async fn finish_extra_attempts(&self, bound_ms: u64) {
         let Some(state) = &self.0 else {
             return;
         };
-        let attempts: Vec<JoinHandle<()>> = std::mem::take(
+        let attempts: Vec<AbortOnDrop> = std::mem::take(
             &mut *state
                 .extra_attempts
                 .lock()
@@ -181,14 +204,11 @@ impl ConnectProbe {
         if attempts.is_empty() {
             return;
         }
-        let aborts: Vec<_> = attempts.iter().map(JoinHandle::abort_handle).collect();
         let all = futures::future::join_all(attempts);
         if bound_ms == 0 {
             all.await;
-        } else if timeout(Duration::from_millis(bound_ms), all).await.is_err() {
-            for abort in aborts {
-                abort.abort();
-            }
+        } else {
+            let _ = timeout(Duration::from_millis(bound_ms), all).await;
         }
     }
 }
@@ -283,6 +303,13 @@ impl TdsConnectionProvider {
         datasource: &str,
         probe: DiagnosticProbe,
     ) -> TdsResult<DiagnosticConnection> {
+        if context.multi_subnet_failover && probe.stop_after == Some(DiagnosticStop::Resolution) {
+            return Err(Error::UsageError(
+                "A diagnostic attempt with MultiSubnetFailover cannot stop after resolution: \
+                 resolving is part of the parallel connect."
+                    .to_string(),
+            ));
+        }
         let connect_probe = ConnectProbe::new(probe);
         let bound_ms = u64::from(context.connect_timeout) * 1000;
         let mut context = context;
@@ -453,11 +480,11 @@ impl TdsConnectionProvider {
                         });
                     } else {
                         debug!(server, instance, "SSRP cache miss");
-                        Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms).await?;
+                        Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms, probe.is_active()).await?;
                         cache_key = Some((server.to_string(), instance.to_string()));
                     }
                 } else {
-                    Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms).await?;
+                    Self::resolve_ssrp(&action_chain, &mut exec_context, context.ssrp_timeout_ms, probe.is_active()).await?;
                 }
             }
 
@@ -661,10 +688,14 @@ impl TdsConnectionProvider {
     }
 
     /// Query SQL Browser (SSRP) to resolve the TCP port or named pipe path for a named instance.
+    /// A diagnostic attempt (`bound_resolution`) has resolving the server count
+    /// against `ssrp_timeout_ms` too, so a slow resolver cannot outlast the
+    /// limit reported for the lookup.
     async fn resolve_ssrp(
         action_chain: &ConnectionActionChain,
         exec_context: &mut ExecutionContext,
         ssrp_timeout_ms: u64,
+        bound_resolution: bool,
     ) -> TdsResult<()> {
         let (server, instance) = action_chain
             .actions()
@@ -706,6 +737,7 @@ impl TdsConnectionProvider {
             &instance,
             ssrp::SSRP_PORT,
             timeout_ms,
+            bound_resolution,
             |addresses| {
                 if !stage.is_disabled() {
                     stage.record(
@@ -1028,6 +1060,73 @@ mod tests {
                 "should not fall through: {err}"
             );
         }
+    }
+
+    // ── Diagnostic probe tests ──
+
+    #[tokio::test]
+    async fn dropping_the_probe_aborts_the_extra_attempts() {
+        let probe = ConnectProbe::new(DiagnosticProbe::default());
+        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let (finished, done) = tokio::sync::oneshot::channel::<()>();
+        probe.add_extra_attempt(tokio::spawn(async move {
+            let _finished = finished;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        }));
+        running.await.unwrap();
+
+        drop(probe);
+
+        // The task's end drops its sender, which completes `done` with an error.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), done)
+                .await
+                .expect("the task was not aborted")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn canceling_the_wait_for_extra_attempts_aborts_them() {
+        let probe = ConnectProbe::new(DiagnosticProbe::default());
+        let (finished, done) = tokio::sync::oneshot::channel::<()>();
+        probe.add_extra_attempt(tokio::spawn(async move {
+            let _finished = finished;
+            std::future::pending::<()>().await;
+        }));
+
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(50), probe.finish_extra_attempts(0)).await;
+        assert!(waiting.is_err(), "the wait has no bound of its own");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), done)
+                .await
+                .expect("the task was left running")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_subnet_failover_cannot_stop_after_resolution() {
+        let context = ClientContext {
+            multi_subnet_failover: true,
+            ..Default::default()
+        };
+        let error = TdsConnectionProvider::new()
+            .diagnose_client(
+                context,
+                "tcp:127.0.0.1,1",
+                DiagnosticProbe {
+                    stop_after: Some(DiagnosticStop::Resolution),
+                    all_addresses: false,
+                },
+            )
+            .await
+            .err()
+            .expect("the combination is refused");
+        assert!(matches!(error, Error::UsageError(_)), "{error}");
     }
 
     // ── Connection retry tests ──

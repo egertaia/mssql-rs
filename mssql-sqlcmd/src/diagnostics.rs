@@ -1523,8 +1523,7 @@ impl Diagnosis {
         let host = step
             .detail(connect_stage::HOST)
             .or_else(|| step.detail(connect_stage::SERVER))
-            .unwrap_or_else(|| target.resolvable_host())
-            .to_string();
+            .map_or_else(|| target.resolvable_host().into_owned(), str::to_string);
         let mut check = Check::new(id, Coverage::Passed);
         check
             .fields
@@ -1641,8 +1640,7 @@ impl Diagnosis {
         };
         let host = step
             .detail(connect_stage::SERVER)
-            .unwrap_or_else(|| target.resolvable_host())
-            .to_string();
+            .map_or_else(|| target.resolvable_host().into_owned(), str::to_string);
         let instance = step
             .detail(connect_stage::INSTANCE)
             .map(str::to_string)
@@ -2106,7 +2104,14 @@ impl Diagnosis {
                         "The server includes both an instance name and a port; sqlcmd uses the port and does not look up the instance.",
                     );
                 }
-                if self.request.trust_server_certificate
+                if self.request.trust_server_certificate && self.request.encrypt == Encrypt::Strict
+                {
+                    self.finding(
+                        Certainty::Informational,
+                        CheckId::ConnectionInput,
+                        "-C is ignored with strict encryption (-Ns): the server certificate is validated.",
+                    );
+                } else if self.request.trust_server_certificate
                     && self
                         .request
                         .host_name_in_certificate
@@ -3519,6 +3524,30 @@ pub(crate) mod tests {
             "{:#?}",
             report.findings
         );
+    }
+
+    #[test]
+    fn strict_encryption_ignores_trust_and_does_not_report_it_as_trusted() {
+        let mut request = request("db01", Depth::ConnectionInput);
+        request.encrypt = Encrypt::Strict;
+        request.trust_server_certificate = true;
+        request.host_name_in_certificate = Some("wrong.example.test".to_string());
+
+        let report = run(request);
+        let findings: Vec<_> = report.findings.iter().map(|f| f.text.as_str()).collect();
+        assert!(
+            findings
+                .iter()
+                .any(|text| text.contains("-C is ignored with strict encryption")),
+            "{findings:#?}"
+        );
+        assert!(
+            findings.iter().all(|text| !text.contains("not validated")),
+            "the certificate name is validated in strict mode: {findings:#?}"
+        );
+        let text = report::text(&report);
+        assert!(text.contains("-C ignored"), "{text}");
+        assert!(!text.contains("server certificate trusted"), "{text}");
     }
 
     #[test]

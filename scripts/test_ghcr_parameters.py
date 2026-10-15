@@ -94,8 +94,13 @@ def run_pipeline(tmp_path):
                 "LOGIN_EXIT": str(login_exit),
                 "MIRROR_EXIT": str(mirror_exit),
             }
+            script_path = tmp_path / "run-step.sh"
+            script_path.write_text(
+                _MOCKS + _expand(script, parameters, variables),
+                encoding="utf-8", newline="\n",
+            )
             result = subprocess.run(
-                [_BASH, "-s"], input=_MOCKS + _expand(script, parameters, variables),
+                [_BASH, script_path.name],
                 cwd=tmp_path, env=env, text=True, capture_output=True,
             )
             results.append((step["displayName"], result))

@@ -302,9 +302,17 @@ pub(crate) struct MockServer {
     server_handle: Option<tokio::task::JoinHandle<()>>,
     server_runtime: tokio::runtime::Runtime,
     query_registry: std::sync::Arc<tokio::sync::Mutex<mssql_mock_tds::QueryRegistry>>,
+    connection_store: std::sync::Arc<tokio::sync::Mutex<mssql_mock_tds::ConnectionStore>>,
 }
 
 impl MockServer {
+    /// The number of logins the server has accepted, including the one
+    /// [`connect_mock_server`] made for the DBC.
+    pub(crate) fn connection_count(&self) -> usize {
+        self.server_runtime
+            .block_on(async { self.connection_store.lock().await.count() })
+    }
+
     pub(crate) fn register_query(&self, query: &str, response: mssql_mock_tds::QueryResponse) {
         self.server_runtime.block_on(async {
             self.query_registry.lock().await.register(query, response);
@@ -419,13 +427,14 @@ pub(crate) fn connect_mock_server_with_trailing_info(
 
     let server_runtime =
         tokio::runtime::Runtime::new().expect("failed to build mock-server runtime");
-    let (server_addr, shutdown_tx, server_handle, query_registry) =
+    let (server_addr, shutdown_tx, server_handle, query_registry, connection_store) =
         server_runtime.block_on(async {
             let server = MockTdsServer::new("127.0.0.1:0")
                 .await
                 .expect("failed to start mock server");
             let addr = server.local_addr();
             let registry = server.query_registry();
+            let connections = server.connection_store();
             registry
                 .lock()
                 .await
@@ -435,7 +444,7 @@ pub(crate) fn connect_mock_server_with_trailing_info(
                 let _ = server.run_with_shutdown(rx).await;
             });
             tokio::time::sleep(Duration::from_millis(100)).await;
-            (addr, tx, handle, registry)
+            (addr, tx, handle, registry, connections)
         });
 
     let datasource = format!("tcp:{},{}", server_addr.ip(), server_addr.port());
@@ -467,5 +476,6 @@ pub(crate) fn connect_mock_server_with_trailing_info(
         server_handle: Some(server_handle),
         server_runtime,
         query_registry,
+        connection_store,
     }
 }

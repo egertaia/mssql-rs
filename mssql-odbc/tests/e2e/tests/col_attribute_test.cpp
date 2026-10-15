@@ -39,13 +39,18 @@
 //   32. VariantExactNumericsReportNumeric - decimal/numeric/money/smallmoney → SQL_C_NUMERIC
 //   33. VariantDecimalStillDeliversAsCharacter - the SQL_C_CHAR read after the attribute
 //   34. VariantBaseTypesMatchMsodbcsql    - every measured-parity base type
+//   35. NameIsReportedWhileTheCursorIsOpen - alias name in both type-name fields
+//   36. NameIsReportedOnceTheRowsAreRead  - the idle session reads the names
+//   37. TypeCreatedAfterTheReadIsNamedAfterADatabaseChange - re-read on a database change
 
 #include "odbc_test_fixture.h"
 #include "odbc_sql_server_types.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 class ColAttributeLiveTest : public ODBCTest {
 protected:
@@ -165,6 +170,107 @@ TEST_F(ColAttributeLiveTest, ConciseTypePerColumnType) {
     EXPECT_EQ(SQL_WVARCHAR, NumericAttr(stmt_, 3, SQL_DESC_CONCISE_TYPE));
     EXPECT_EQ(SQL_DECIMAL, NumericAttr(stmt_, 4, SQL_DESC_CONCISE_TYPE));
     SQLCloseCursor(stmt_);
+}
+
+// Alias types are numbered per database, so COLMETADATA names one only by its
+// UserType. msodbcsql reads the names from systypes when an alias-typed column
+// is first described and after each database change (sqlccmd.cpp
+// RefreshShilohUDTCache), on the session when it is idle and on a separate
+// login while rows are pending, and reports them for both type-name fields
+// (sqlcdesc.cpp GetIRDField).
+class AliasTypeLiveTest : public ColAttributeLiveTest {
+protected:
+    void TearDown() override {
+        SQLCloseCursor(stmt_);
+        for (const std::string& name : typeNames_) {
+            ExecDirectIgnoreError("DROP TYPE dbo." + name);
+        }
+        ColAttributeLiveTest::TearDown();
+    }
+
+    std::string CreateAliasType() {
+        const std::string name =
+            "mssqlrs_alias_" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        ExecDirect("CREATE TYPE dbo." + name + " FROM varchar(17)");
+        typeNames_.push_back(name);
+        return name;
+    }
+
+    // CAST accepts only system types (error 243), so the rows come from a
+    // table variable declared with the alias type.
+    void SelectAliasColumn(const std::string& typeName) {
+        ExecDirect("SET NOCOUNT ON;"
+                   " DECLARE @t TABLE (alias_col " + typeName + ", base_col varchar(5));"
+                   " INSERT @t VALUES ('first', 'x'), ('second', 'y');"
+                   " SELECT alias_col, base_col FROM @t ORDER BY base_col");
+    }
+
+    void FetchAliasValues() {
+        for (const char* expected : {"first", "second"}) {
+            ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
+            SQLCHAR value[32] = {};
+            SQLLEN valueLen = 0;
+            ASSERT_SQL_OK(SQLGetData(stmt_, 1, SQL_C_CHAR, value, sizeof(value), &valueLen),
+                          SQL_HANDLE_STMT, stmt_);
+            EXPECT_STREQ(expected, reinterpret_cast<const char*>(value));
+        }
+        EXPECT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
+    }
+
+    void SetCatalog(const std::string& name) {
+        SqlTString catalog = ODBCTestUtils::ToSqlTStr(name);
+        ASSERT_SQL_OK(SQLSetConnectAttr(dbc_, SQL_ATTR_CURRENT_CATALOG,
+                                        const_cast<SQLTCHAR*>(catalog.c_str()), SQL_NTS),
+                      SQL_HANDLE_DBC, dbc_);
+    }
+
+private:
+    std::vector<std::string> typeNames_;
+};
+
+// The first description happens with the cursor's rows pending, so the names
+// are read without touching the session that is serving them.
+TEST_F(AliasTypeLiveTest, NameIsReportedWhileTheCursorIsOpen) {
+    const std::string typeName = CreateAliasType();
+    SelectAliasColumn(typeName);
+
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_LOCAL_TYPE_NAME));
+    EXPECT_EQ("varchar", TextAttr(stmt_, 2, SQL_DESC_TYPE_NAME));
+    EXPECT_EQ("varchar", TextAttr(stmt_, 2, SQL_DESC_LOCAL_TYPE_NAME));
+    FetchAliasValues();
+}
+
+// Once every row has been read the session is idle and answers itself.
+TEST_F(AliasTypeLiveTest, NameIsReportedOnceTheRowsAreRead) {
+    const std::string typeName = CreateAliasType();
+    SelectAliasColumn(typeName);
+    FetchAliasValues();
+
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+    EXPECT_EQ(typeName, TextAttr(stmt_, 1, SQL_DESC_LOCAL_TYPE_NAME));
+}
+
+// No supported server sends the "Type added." message msodbcsql also watches
+// for (sqlcerr.cpp), so a type created after the read keeps its base type name
+// until a database change, even one that returns to the same database.
+TEST_F(AliasTypeLiveTest, TypeCreatedAfterTheReadIsNamedAfterADatabaseChange) {
+    const std::string earlier = CreateAliasType();
+    SelectAliasColumn(earlier);
+    EXPECT_EQ(earlier, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+    SQLCloseCursor(stmt_);
+
+    const std::string later = CreateAliasType();
+    SelectAliasColumn(later);
+    EXPECT_EQ("varchar", TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
+    SQLCloseCursor(stmt_);
+
+    const std::string database = ODBCTestConfig::Instance().Database();
+    SetCatalog(database == "master" ? "tempdb" : "master");
+    SetCatalog(database);
+    SelectAliasColumn(later);
+    EXPECT_EQ(later, TextAttr(stmt_, 1, SQL_DESC_TYPE_NAME));
 }
 
 // Matches retail msodbcsql 18.6.2.1. GetIRDField in

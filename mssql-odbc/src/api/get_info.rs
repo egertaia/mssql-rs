@@ -1483,8 +1483,9 @@ struct LookupFailure {
 /// query from opening a transaction (`sqlccmd.cpp` bug #656241); this driver
 /// drives transactions with TDS transaction-manager requests and never enables
 /// implicit transactions, so a bare batch already carries that guarantee. The
-/// alias-type half has no counterpart here — there is no UDT cache to refresh —
-/// which leaves just the `SELECT`.
+/// alias-type half is read separately, by `alias_types`, because it may log in
+/// separately while a cursor is open and this lookup does not (AB#48044), which
+/// leaves just the `SELECT`.
 /// `timeout_secs` is `SQL_ATTR_CONNECTION_TIMEOUT`, with `0` meaning no
 /// deadline; see the call site for why that is the attribute msodbcsql bounds
 /// this query with.

@@ -73,13 +73,15 @@ esac
         setup += "".join(
             f"export {name}={shlex.quote(value)}; " for name, value in values.items()
         )
+        # Keep quoting out of the Windows WSL launcher's command-line parser.
+        (tmp_path / "invoke.sh").write_text(
+            setup + 'chmod +x bin/docker bin/df; export PATH="$PWD/bin:$PATH"; '
+            "exec bash ./docker-cargo-run.sh " + shlex.join(_ARGS) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
         result = subprocess.run(
-            [
-                _BASH, "-c",
-                setup + 'chmod +x bin/docker bin/df; export PATH="$PWD/bin:$PATH"; '
-                'exec bash ./docker-cargo-run.sh "$@"',
-                "test-wrapper", *_ARGS,
-            ],
+            [_BASH, "-c", "bash ./invoke.sh"],
             cwd=tmp_path,
             env=env,
             capture_output=True,

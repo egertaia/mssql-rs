@@ -296,6 +296,13 @@ stages:
           set -euo pipefail
           python3 -m unittest discover -s .pipeline/scripts -p 'test_*.py' -v
         displayName: Test pipeline helper scripts
+      - bash: |
+          set -euo pipefail
+          python3 -m venv "$AGENT_TEMPDIRECTORY/cargo-wrapper-tests"
+          TEST_PYTHON="$AGENT_TEMPDIRECTORY/cargo-wrapper-tests/bin/python"
+          "$TEST_PYTHON" -m pip install --quiet pytest pyyaml
+          "$TEST_PYTHON" -m pytest scripts/test_docker_cargo_run.py -q
+        displayName: Test Cargo container credential handling
       - template: build-template-container.yml
         parameters:
           architecture: x64

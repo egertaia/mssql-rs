@@ -26,6 +26,8 @@ _ARGS = ("--rm", "-v", "workspace with spaces:/workspace", "test-image", "cargo"
 @pytest.fixture
 def run_wrapper(tmp_path):
     if _BASH is None:
+        if os.name == "nt":
+            pytest.skip("Bash execution is enforced by the Linux pipeline job")
         pytest.fail("Bash is required for the Cargo credential regression tests")
     shutil.copyfile(
         _ROOT / ".pipeline" / "scripts" / "docker-cargo-run.sh",
@@ -248,4 +250,18 @@ def test_regressions_are_wired_without_removing_existing_selectors():
     if (_ROOT / "scripts" / "test_dependency_intake.py").exists():
         selectors.add("scripts/test_dependency_intake.py")
     assert selectors <= set(command.split())
+    assert not step.get("continueOnError", False)
+
+
+def test_linux_job_enforces_bash_regressions():
+    stages = load_template("validation-stages.yml")["stages"]
+    build = next(stage for stage in stages if stage["stage"] == "Build")
+    linux = next(job for job in build["jobs"] if job.get("job") == "Build_Linux")
+    step = next(
+        step for step in linux["steps"]
+        if step.get("displayName") == "Test Cargo container credential handling"
+    )
+    assert step["bash"].startswith("set -euo pipefail\n")
+    assert '"$TEST_PYTHON" -m pytest scripts/test_docker_cargo_run.py -q' in step["bash"]
+    assert step.get("condition", "succeeded()") == "succeeded()"
     assert not step.get("continueOnError", False)

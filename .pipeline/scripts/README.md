@@ -47,6 +47,8 @@ verified by this hardening.
 
 Run the mocked-Docker and template-gating regression tests without Docker or feed
 access using `python -m pytest scripts/test_docker_cargo_run.py -q` (Bash required).
+The Linux validation job enforces these executable tests; Windows runs the
+template checks and skips executable cases only when Bash is not installed.
 
 ### clone-mssql-python.sh
 

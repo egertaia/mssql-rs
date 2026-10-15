@@ -259,9 +259,10 @@ def test_linux_job_enforces_bash_regressions():
     linux = next(job for job in build["jobs"] if job.get("job") == "Build_Linux")
     step = next(
         step for step in linux["steps"]
-        if step.get("displayName") == "Test Cargo container credential handling"
+        if step.get("displayName") == "Unit test Bash pipeline scripts"
     )
     assert step["bash"].startswith("set -euo pipefail\n")
-    assert '"$TEST_PYTHON" -m pytest scripts/test_docker_cargo_run.py -q' in step["bash"]
+    command = next(line for line in step["bash"].splitlines() if "-m pytest" in line)
+    assert "scripts/test_docker_cargo_run.py" in command.split()
     assert step.get("condition", "succeeded()") == "succeeded()"
     assert not step.get("continueOnError", False)

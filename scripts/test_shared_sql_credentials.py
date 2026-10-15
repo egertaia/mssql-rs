@@ -48,6 +48,36 @@ def credential():
     return "Aa1!" + secrets.token_hex(24)
 
 
+def test_native_shell_is_available():
+    if sys.platform == "win32":
+        assert PWSH, "PowerShell is required for Windows credential regression tests"
+    elif sys.platform.startswith("linux"):
+        assert BASH, "Bash is required for Linux credential regression tests"
+
+
+@pytest.mark.parametrize(("platform", "shell"), [("win32", "PWSH"), ("linux", "BASH")])
+def test_native_shell_gate_rejects_missing_interpreter(monkeypatch, platform, shell):
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setitem(globals(), shell, None)
+    with pytest.raises(AssertionError, match="is required"):
+        test_native_shell_is_available()
+
+
+def test_linux_execution_is_wired_before_build():
+    build = next(s for s in template("validation-stages.yml")["stages"] if s.get("stage") == "Build")
+    linux = next(job for job in build["jobs"] if job.get("job") == "Build_Linux")
+    step = next(
+        step for step in linux["steps"]
+        if step.get("displayName") == "Test shared SQL credential scripts (Linux)"
+    )
+    assert "set -euo pipefail" in step["bash"]
+    assert "-m pytest scripts/test_shared_sql_credentials.py -q" in step["bash"]
+    assert step.get("condition", "succeeded()") == "succeeded()"
+    assert not step.get("continueOnError", False)
+    container = next(step for step in linux["steps"] if step.get("template") == "build-template-container.yml")
+    assert linux["steps"].index(step) < linux["steps"].index(container)
+
+
 def test_generator_policy_randomness_and_output_only(capsys, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     passwords, generations = set(), set()

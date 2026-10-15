@@ -311,6 +311,12 @@ stages:
           set -euo pipefail
           python3 -m unittest discover -s .pipeline/scripts -p 'test_*.py' -v
         displayName: Test pipeline helper scripts
+      - bash: |
+          set -euo pipefail
+          python3 -m venv "$AGENT_TEMPDIRECTORY/sql-credential-tests"
+          "$AGENT_TEMPDIRECTORY/sql-credential-tests/bin/python" -m pip install --quiet pytest pyyaml
+          "$AGENT_TEMPDIRECTORY/sql-credential-tests/bin/python" -m pytest scripts/test_shared_sql_credentials.py -q
+        displayName: Test shared SQL credential scripts (Linux)
       - template: build-template-container.yml
         parameters:
           architecture: x64

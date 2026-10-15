@@ -38,6 +38,12 @@ initialization while consumers are active; queue a new run when reinitializing.
 Local tests cover the contract, not Azure Pipelines' output retention or masking
 on retries; those require a scoped live validation.
 
+`scripts/test_shared_sql_credentials.py` runs in both the Windows packaging
+checks and a focused Linux build-job step. The suite requires PowerShell on
+Windows and Bash on Linux, so a missing native shell fails rather than silently
+skipping that platform's executable regressions. The other platform's shell
+cases may skip when its interpreter is unavailable.
+
 See `.pipeline/docs/arm-sql-host-design.md` for the full design.
 
 ## Scripts

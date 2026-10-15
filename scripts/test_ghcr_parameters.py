@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -62,11 +63,12 @@ def _expand(text, parameters, variables):
 
 @pytest.fixture
 def run_pipeline(tmp_path):
-    if _BASH is None:
-        pytest.skip("Bash is required")
-
     def run(owner="microsoft/mssql-rs", user="Build-User", token=None, *, bypass=False,
             login_exit=0, mirror_exit=0):
+        if _BASH is None:
+            if os.environ.get("GHCR_TEST_REQUIRE_BASH") == "1":
+                pytest.fail("Bash is required for enforced GHCR behavioral tests")
+            pytest.skip("Bash is required")
         token = secrets.token_hex(24) if token is None else token
         parameters = {"ghcrOrg": owner, "ghcrUsername": user}
         variables = {
@@ -146,6 +148,25 @@ def test_tests_are_in_shared_validation():
     assert "scripts/test_ghcr_parameters.py" in step["pwsh"].split()
     assert step.get("condition", "succeeded()") == "succeeded()"
     assert not step.get("continueOnError", False)
+    linux = next(j for j in build["jobs"] if j.get("job") == "Build_Linux")
+    bash_step = next(s for s in linux["steps"] if s.get("displayName") ==
+                     "Test GHCR parameter handling (Linux)")
+    assert "scripts/test_ghcr_parameters.py" in bash_step["bash"].split()
+    assert 'python3 -m venv "$venv"' in bash_step["bash"]
+    assert '"$venv/bin/python" -m pytest' in bash_step["bash"]
+    assert "set -euo pipefail" in bash_step["bash"]
+    assert bash_step["env"]["GHCR_TEST_REQUIRE_BASH"] == "1"
+    assert bash_step.get("condition", "succeeded()") == "succeeded()"
+    assert not bash_step.get("continueOnError", False)
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_missing_bash_cannot_silently_skip_enforced_ci(run_pipeline, monkeypatch, required):
+    monkeypatch.setattr(sys.modules[__name__], "_BASH", None)
+    monkeypatch.setenv("GHCR_TEST_REQUIRE_BASH", "1" if required else "0")
+    with pytest.raises(pytest.fail.Exception if required else pytest.skip.Exception,
+                       match="Bash is required"):
+        run_pipeline()
 
 
 @pytest.mark.parametrize("field", ["owner", "user"])

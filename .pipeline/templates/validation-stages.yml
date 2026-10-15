@@ -683,6 +683,11 @@ stages:
           osType: Linux
           fuzzDurationSeconds: 300
           fuzzTarget: fuzz_bulk_copy
+      - template: fuzz-template.yml
+        parameters:
+          osType: Linux
+          fuzzDurationSeconds: 300
+          fuzzTarget: fuzz_data_classification
 
   - job: Fuzz_Odbc_Ffi_Linux
     displayName: Fuzz Test ODBC FFI Execute Linux (30 min)

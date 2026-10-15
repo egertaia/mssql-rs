@@ -193,6 +193,9 @@ on the `master` branch.
   do not re-enter `begin_operation` while holding that fence (AB#49386). Once
   active-operation cancellation is ruled out, wait for brief statement-lock
   holders rather than skipping idle cleanup on contention.
+  Snapshot exhaustion before resetting cursor state: an exhausted response
+  with no pending parameter-array completion must not claim the client again,
+  because a DBC-scoped call may already own it.
 - **A success code is a promise about the caller's buffer, so never report
   `SQL_SUCCESS` for a call that wrote less than the indicator claims.** Report
   `SQL_SUCCESS_WITH_INFO` with `01004` when a read truncates, so the caller knows

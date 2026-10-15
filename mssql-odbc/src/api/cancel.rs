@@ -357,6 +357,60 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_cursor_cleanup_does_not_take_a_dbc_operations_client() {
+        use crate::api::odbc_types::*;
+        use crate::api::txn::{release_dbc_client, try_claim_idle_dbc_client};
+        use mssql_mock_tds::QueryResponse;
+
+        for cancel in [false, true] {
+            let h = TestHandles::with_env_dbc_stmt();
+            let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };
+            let dbc = stmt.parent_dbc();
+            let _server = crate::test_support::connect_mock_server(
+                dbc,
+                "SELECT 1",
+                QueryResponse::select_one(),
+            );
+            let sql: Vec<u16> = "SELECT 1".encode_utf16().collect();
+            let exec = || unsafe {
+                crate::api::SQLExecDirectW(h.stmt, sql.as_ptr(), i16::try_from(sql.len()).unwrap())
+            };
+            assert_eq!(SQL_SUCCESS, exec());
+            assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+            assert_eq!(SQL_NO_DATA, unsafe { crate::api::SQLFetch(h.stmt) });
+            assert!(stmt.inner.lock().unwrap().batch_exhausted);
+            let (client, _, _) = try_claim_idle_dbc_client(dbc).unwrap();
+            let rc = unsafe {
+                if cancel {
+                    crate::api::SQLCancel(h.stmt)
+                } else {
+                    crate::api::SQLFreeStmt(h.stmt, SQL_CLOSE)
+                }
+            };
+            assert!(dbc.inner.lock().unwrap().client.is_none());
+            release_dbc_client(dbc, client);
+            assert_eq!(
+                rc,
+                if cancel {
+                    SQL_SUCCESS_WITH_INFO
+                } else {
+                    SQL_SUCCESS
+                }
+            );
+            {
+                let state = stmt.inner.lock().unwrap();
+                assert!(!state.has_state(crate::handles::stmt::STMT_STATE_CURSOR_OPEN));
+                if cancel {
+                    assert_eq!(state.diag_records.len(), 1);
+                    assert_eq!(state.diag_records[0].sql_state, *b"01S05");
+                }
+            }
+            assert_eq!(SQL_SUCCESS, exec());
+            assert_eq!(SQL_SUCCESS, unsafe { crate::api::SQLFetch(h.stmt) });
+        }
+    }
+
+    #[test]
     fn cancel_clears_need_data_and_restores_prepared_plan() {
         let h = TestHandles::with_env_dbc_stmt();
         let stmt = unsafe { handle_from_raw::<StmtHandle>(h.stmt) };

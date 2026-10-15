@@ -152,12 +152,19 @@ pub(super) fn free_stmt_close_locked(
         return SQL_SUCCESS;
     }
 
+    // An exhausted response has already released the client to other DBC calls.
+    // Parameter arrays still need their completion status published on close.
+    let needs_drain = !stmt_state.batch_exhausted || stmt_state.parameter_array.is_some();
     // See the identical comment in sql_close_cursor_safe.
     let pending_fetch_error = stmt_state.pending_fetch_error.take();
     reset_cursor_state(&mut stmt_state);
     drop(stmt_state);
 
-    let outcome = drain_and_release(stmt, statement_handle);
+    let outcome = if needs_drain {
+        drain_and_release(stmt, statement_handle)
+    } else {
+        DrainOutcome::Clean
+    };
     if let Some(e) = pending_fetch_error {
         if let Ok(mut stmt_state) = stmt.inner.lock() {
             post_tds_error(&mut stmt_state, &e, SQLSTATE_HY000);

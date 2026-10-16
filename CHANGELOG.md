@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 
+- `mssql-tds`: public `SecurityContextProvider` trait and
+  `ClientContext::security_context_provider` field. When set, integrated (SSPI)
+  logins build their `SecurityContext` through the provider instead of the
+  built-in SSPI/GSSAPI context, so downstream crates can plug in custom schemes
+  such as NTLM on Linux/macOS. The provider receives the server, port and the
+  `IntegratedAuthConfig`, including TLS channel bindings for Extended
+  Protection. Equivalent to `SqlConnection.SspiContextProvider` in
+  Microsoft.Data.SqlClient (#707).
+
 - `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
   into supported numeric and date/time C targets, with the existing
   bound-fetch 1 MiB source-data cap (AB#47238).

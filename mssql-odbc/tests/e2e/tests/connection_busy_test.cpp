@@ -76,11 +76,19 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelReleasesConnectionLikeFreeStmtClos
             } else {
                 ASSERT_EQ(SQL_NO_DATA, SQLFetch(stmt_));
             }
-            ASSERT_SQL_OK(cancel ? SQLCancel(stmt_) : SQLFreeStmt(stmt_, SQL_CLOSE),
+            ASSERT_SQL_OK(cancel ? CancelIdleStatement() : SQLFreeStmt(stmt_, SQL_CLOSE),
                           SQL_HANDLE_STMT, stmt_);
-            SQLSMALLINT columns = -1;
-            EXPECT_EQ(SQL_ERROR, SQLNumResultCols(stmt_, &columns));
-            EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+            {
+                // These errors live in the DM's list, whose next-call cleanup
+                // occurs before unixODBC takes its statement lock.
+                std::unique_lock<std::shared_mutex> lock(diagnostics_mutex_);
+                SQLSMALLINT columns = -1;
+                EXPECT_EQ(SQL_ERROR, SQLNumResultCols(stmt_, &columns));
+                EXPECT_EQ(SQL_ERROR, SQLFetch(stmt_));
+                SQLULEN timeout = 0;
+                ASSERT_SQL_OK(SQLGetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, &timeout, 0, nullptr),
+                              SQL_HANDLE_STMT, stmt_);
+            }
             ASSERT_SQL_OK(Run(other, "SELECT " + std::to_string(token)),
                           SQL_HANDLE_STMT, other);
             ASSERT_SQL_OK(SQLFetch(other), SQL_HANDLE_STMT, other);
@@ -104,12 +112,12 @@ ODBC_TEST_F(ConnectionBusyLiveTest, IdleCancelPreservesPreparedStatementAndBindi
     ASSERT_SQL_OK(BindInt(stmt_, 1, &parameter, &indicator), SQL_HANDLE_STMT, stmt_);
     ASSERT_SQL_OK(SQLBindCol(stmt_, 1, SQL_C_SLONG, &value, sizeof(value), nullptr),
                   SQL_HANDLE_STMT, stmt_);
-    ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+    ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
     for (int execution = 0; execution < 2; ++execution) {
         ASSERT_SQL_OK(SQLExecute(stmt_), SQL_HANDLE_STMT, stmt_);
         ASSERT_SQL_OK(SQLFetch(stmt_), SQL_HANDLE_STMT, stmt_);
         EXPECT_EQ(parameter, value);
-        ASSERT_SQL_OK(SQLCancel(stmt_), SQL_HANDLE_STMT, stmt_);
+        ASSERT_SQL_OK(CancelIdleStatement(), SQL_HANDLE_STMT, stmt_);
         ++parameter;
     }
     ASSERT_SQL_OK(SQLFreeStmt(stmt_, SQL_UNBIND), SQL_HANDLE_STMT, stmt_);

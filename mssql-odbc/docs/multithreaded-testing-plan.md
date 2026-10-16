@@ -90,6 +90,13 @@ ODBC_TEST_F_MODES(GetDataLiveTest, EachRunReadsItsOwnValue,
   other call clears the owner's diagnostics, and an idle `SQLCancel` also
   closes the open cursor on both drivers. Cross-thread cancel has its own test,
   `multithreaded_tests/cancel_test.cpp`.
+- Idle-cancel bodies use `CancelIdleStatement()` to exclude diagnostic observers
+  during `SQLCancel`, whose DM diagnostic cleanup is not protected by unixODBC's
+  `Threading=1`. The post-close invalid-state probes also hold
+  `diagnostics_mutex_` until a harmless attribute read clears their DM-generated
+  errors. All other calls still overlap diagnostic reads, and no mode or
+  assertion is skipped. Rust cancellation tests cover driver-level statement
+  lock contention directly, without the unsafe DM overlap.
 - There is no mode that runs the whole body on one shared STMT or descriptor.
   Bound buffers live on each body's stack, and even without bindings a STMT
   holds one cursor:
@@ -276,6 +283,12 @@ Measured 2026-10-08 on both drivers unless noted.
   unfetched, partially fetched, and exhausted cursors, returned `01S05`, and
   allowed a second statement to execute. The native Driver Manager leg also
   passed all eight `ConnectionBusyLiveTest.IdleCancel*` variants.
+  A Linux unixODBC 2.3.9 standalone mock-driver probe reproduced malformed
+  diagnostic records through the DM at `Threading=1`, without mssql-odbc or
+  SQL Server. Direct-driver observation avoided that DM corruption, but Windows
+  msodbcsql can treat cancellation overlapping its diagnostic lock as a no-op.
+  The e2e observer gate therefore excludes only those unsafe overlaps while
+  keeping the idle-close contract deterministic on both drivers.
 
 ## Scenarios
 

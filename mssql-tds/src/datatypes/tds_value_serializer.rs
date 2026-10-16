@@ -4175,11 +4175,14 @@ mod serializer_tests {
             crate::datatypes::sql_string::EncodingType::Utf8,
         ));
 
-        block_on(TdsValueSerializer::serialize_value(
-            &mut writer,
-            &value,
-            &ctx,
-        ))
+        block_on(
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                &mut writer,
+                &value,
+                &ctx,
+                None,
+            ),
+        )
         .unwrap();
 
         let bytes = payload(&writer);

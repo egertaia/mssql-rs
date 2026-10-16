@@ -5,7 +5,7 @@ use std::borrow::Cow;
 
 use bitflags::bitflags;
 
-use crate::datatypes::column_values::DEFAULT_VARTIME_SCALE;
+use crate::datatypes::column_values::{ColumnValues, DEFAULT_VARTIME_SCALE};
 use crate::datatypes::encoder::SqlValueEncoder;
 use crate::datatypes::sql_string::{EncodingType, SqlString};
 use crate::datatypes::sql_tvp::TvpTypeName;
@@ -761,7 +761,15 @@ impl RpcParameter {
         };
 
         let bytes = match bytes {
-            Cow::Borrowed(_) => return Ok((Cow::Borrowed(value), had_loss)),
+            Cow::Borrowed(bytes)
+                if matches!(
+                    &column_value,
+                    ColumnValues::String(original) if bytes.len() == original.bytes.len()
+                ) =>
+            {
+                return Ok((Cow::Borrowed(value), had_loss));
+            }
+            Cow::Borrowed(bytes) => bytes.to_vec(),
             std::borrow::Cow::Owned(bytes) => bytes,
         };
         let sql_string = SqlString::new(bytes, EncodingType::LcidBased(*db_collation));
@@ -1107,6 +1115,34 @@ mod tests {
 
         let (value, had_loss) = parameter.value_for_encryption(&collation).unwrap();
         assert!(matches!(value, Cow::Borrowed(_)));
+        assert!(!had_loss);
+    }
+
+    #[test]
+    fn encrypted_preencoded_narrow_value_uses_fitted_prefix() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(SqlString::new(
+                    b"a ".to_vec(),
+                    EncodingType::LcidBased(collation),
+                )),
+                1,
+            ),
+        );
+
+        let (value, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+        let SqlType::Varchar(Some(value), 1) = value.as_ref() else {
+            panic!("expected a fitted varchar(1)");
+        };
+        assert_eq!(value.bytes, b"a");
         assert!(!had_loss);
     }
 

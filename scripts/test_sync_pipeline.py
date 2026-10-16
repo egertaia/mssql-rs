@@ -113,6 +113,8 @@ az() {
     esac
 }
 """
+    script_path = tmp_path / "run-sync.sh"
+    script_path.write_text(mocks + script, encoding="utf-8", newline="\n")
 
     def run(*, override="", diff_status=1, pr_id="", push_status=0, list_status=0):
         env = {
@@ -128,16 +130,26 @@ az() {
             "MOCK_LIST_STATUS": str(list_status),
         }
         result = subprocess.run(
-            [_BASH, "-s"], input=mocks + script, cwd=tmp_path,
+            [_BASH, script_path.name], cwd=tmp_path,
             env=env, capture_output=True, text=True, timeout=15,
         )
+        call_log = tmp_path / "calls.log"
+        assert call_log.exists(), result.stdout + result.stderr
         calls = [
             entry.decode("utf-8").split("\0")
-            for entry in (tmp_path / "calls.log").read_bytes().split(b"\0\0")[:-1]
+            for entry in call_log.read_bytes().split(b"\0\0")[:-1]
         ]
         return result, calls
 
     return run
+
+
+def test_sync_script_uses_lf_newlines(run_sync, tmp_path):
+    result, _ = run_sync(diff_status=0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    script = (tmp_path / "run-sync.sh").read_bytes()
+    assert b"\n" in script
+    assert b"\r" not in script
 
 
 @pytest.mark.parametrize(

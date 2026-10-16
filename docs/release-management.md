@@ -302,14 +302,14 @@ Sprint end:
 ### Release build
 
 1. **Run the Official Python Wheels Build** for the source commit to release
-2. **Trigger the Official release pipeline** with that build selected and `publishNuGet: true`
-   - This produces a clean semver NuGet: `mssql-python-rs-wheels.0.2.1`
+2. **Trigger the Official release pipeline** with that build selected and `publishToFeed: true`
+   - This uploads the clean-semver wheels `mssql-python-rs==0.2.1` to the Azure Artifacts PyPI feed via `twine`
    - OneBranch runs full SDL scanning (BinSkim, Clippy, AV)
-   - Package is published to `mssql-rs/mssql-rs` feed
+   - Wheels are published to the `mssql-rs_Public` feed's PyPI index
 
 ### Optional mssql-py-core source tag
 
-The release pipeline's `tagRelease` option is separate from NuGet publication. It reads
+The release pipeline's `tagRelease` option is separate from feed publication. It reads
 `[package].version` from `mssql-py-core/Cargo.toml`, then creates the corresponding tag
 and release branch. For a Rust crate version of `0.1.10`, it creates:
 
@@ -337,11 +337,11 @@ Do not derive this tag or branch from the Python/NuGet version when the versions
 `.pipeline/OneBranch/OfficialPythonWheelsRelease.yml` consumes the selected
 `Official Python Wheels Build` run without rebuilding it. All release switches
 default to `false`. Official wheel artifacts are always downloaded and validated
-against that build's source metadata, even when NuGet publishing is disabled.
+against that build's source metadata, even when feed publishing is disabled.
 
 | Switch | Behavior |
 |---|---|
-| `publishNuGet` | Prepare, pack, verify and publish the NuGet package after wheel validation. When false, these NuGet-only steps are omitted; wheel download and validation still run. |
+| `publishToFeed` | Collect, authenticate and `twine upload` the validated wheels to the Azure Artifacts PyPI feed after wheel validation. When false, these upload-only steps are omitted; wheel download and validation still run. |
 | `publishMssqlTds` | Select `mssql-tds` for crates.io publication through ESRP. |
 | `publishMssqlMockTds` | Select `mssql-mock-tds` for crates.io publication through ESRP. |
 | `validateCratesOnly` | Validate the crate artifact and run selected-crate preflights without ESRP publication. Can also validate the artifact with neither crate selected. |
@@ -377,12 +377,12 @@ Every Rust job re-downloads `drop_Build_RustCrates` from the same immutable
 hashes, and mock dependency. Publishers do not consume files produced by registry
 jobs. No crate job relies on another job's filesystem or job-local variables.
 
-Tagging always waits for successful wheel validation, plus NuGet publication when
-`publishNuGet` is selected. It never waits for Rust crate publication. Leaving all
-switches off is a wheel validation-only run: no NuGet packaging or publication,
+Tagging always waits for successful wheel validation, plus feed publication when
+`publishToFeed` is selected. It never waits for Rust crate publication. Leaving all
+switches off is a wheel validation-only run: no wheel upload or publication,
 ESRP, Git tags, or release-branch writes.
 
-NuGet and tag metadata come from the selected build's exact source commit, not
+Feed upload and tag metadata come from the selected build's exact source commit, not
 the release pipeline's checkout or the current branch tip. A missing branch,
 commit, or required source file fails the operation without a checkout fallback.
 Governed Git jobs configure OneBranch's built-in checkout with `ob_git_fetchDepth` and
@@ -401,7 +401,7 @@ Once a live run is authorized, select a known successful Official Build and leav
 off to exercise genuine artifacts in the governed container without publishing.
 That all-off run does not exercise the crate registry jobs. For an authorized
 non-publishing crate preflight run, set `validateCratesOnly: true` and select
-`publishMssqlTds` and/or `publishMssqlMockTds`; leave `publishNuGet` and `tagRelease`
+`publishMssqlTds` and/or `publishMssqlMockTds`; leave `publishToFeed` and `tagRelease`
 false. Use an Official Build whose selected crate versions are not yet published.
 Mock-only validation also requires its core version to be available already.
 Local regression tests also cover missing wheels, incorrect names/versions,
@@ -415,8 +415,8 @@ If a critical bug is found after release:
 2. Bump `[project].version` in `mssql-py-core/pyproject.toml` for the Python hotfix (for example, `0.2.1` → `0.2.2`)
 3. Bump `[package].version` in `mssql-py-core/Cargo.toml` only if the Rust crate also needs a new independent version
 4. Run the Official Python Wheels Build for the hotfix commit
-5. Trigger the Official release pipeline with `publishNuGet: true`
-   - This publishes `mssql-python-rs-wheels.0.2.2`
+5. Trigger the Official release pipeline with `publishToFeed: true`
+   - This publishes `mssql-python-rs==0.2.2` wheels to the Azure Artifacts PyPI feed
 6. Enable `tagRelease` only when creating the separate Cargo-versioned mssql-py-core tag and release branch
 7. Update `mssql-python` to use `mssql-python-rs==0.2.2`
 

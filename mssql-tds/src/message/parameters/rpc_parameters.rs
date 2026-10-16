@@ -100,6 +100,8 @@ pub(crate) struct EncryptedRpcValue {
     pub(crate) ciphertext: Option<Vec<u8>>,
     /// Cipher metadata describing how the value was encrypted.
     pub(crate) metadata: RpcEncryptionMetadata,
+    /// Whether preparing the plaintext substituted an unmappable character.
+    pub(crate) had_conversion_loss: bool,
 }
 
 /// Wire-type selector for a data-at-execution (streamed) PLP parameter.
@@ -264,8 +266,10 @@ impl RpcParameter {
 
     /// Limits a narrow string value by its encoded wire-byte length.
     ///
-    /// This remains active for PLP-framed values whose SQL declaration is
-    /// `varchar(max)`, allowing an API layer to enforce its own length contract.
+    /// This remains active for materialized PLP-framed values whose SQL
+    /// declaration is `varchar(max)`, allowing an API layer to enforce its own
+    /// length contract. Streamed values must enforce their running limit while
+    /// supplying chunks and reject this builder at execution setup.
     pub fn with_narrow_string_byte_limit(mut self, maximum: usize) -> Self {
         self.narrow_string_byte_limit = Some(maximum);
         self
@@ -275,6 +279,17 @@ impl RpcParameter {
     /// data-at-execution (streamed) path.
     pub(crate) fn is_data_at_exec(&self) -> bool {
         matches!(self.value, RpcValue::Streamed(_))
+    }
+
+    pub(crate) fn validate_streamed_configuration(&self) -> TdsResult<()> {
+        if self.is_data_at_exec() && self.narrow_string_byte_limit.is_some() {
+            return Err(Error::UsageError(
+                "Encoded-byte limits are not supported on streamed parameters; enforce the \
+                 limit while supplying chunks or send a materialized value."
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns a usage error if any parameter in `params` is data-at-execution
@@ -703,10 +718,12 @@ impl RpcParameter {
         &mut self,
         ciphertext: Option<Vec<u8>>,
         metadata: RpcEncryptionMetadata,
+        had_conversion_loss: bool,
     ) {
         self.encrypted = Some(Box::new(EncryptedRpcValue {
             ciphertext,
             metadata,
+            had_conversion_loss,
         }));
     }
 
@@ -743,15 +760,18 @@ impl RpcParameter {
             return Ok((Cow::Borrowed(value), false));
         };
 
-        let mut fitted = value.clone();
-        let sql_string = SqlString::new(bytes.into_owned(), EncodingType::LcidBased(*db_collation));
-        match &mut fitted {
-            SqlType::Varchar(string, _)
-            | SqlType::VarcharMax(string)
-            | SqlType::Char(string, _)
-            | SqlType::Text(string) => *string = Some(sql_string),
+        let bytes = match bytes {
+            Cow::Borrowed(_) => return Ok((Cow::Borrowed(value), had_loss)),
+            std::borrow::Cow::Owned(bytes) => bytes,
+        };
+        let sql_string = SqlString::new(bytes, EncodingType::LcidBased(*db_collation));
+        let fitted = match value {
+            SqlType::Varchar(_, length) => SqlType::Varchar(Some(sql_string), *length),
+            SqlType::VarcharMax(_) => SqlType::VarcharMax(Some(sql_string)),
+            SqlType::Char(_, length) => SqlType::Char(Some(sql_string), *length),
+            SqlType::Text(_) => SqlType::Text(Some(sql_string)),
             _ => return Ok((Cow::Borrowed(value), false)),
-        }
+        };
         Ok((Cow::Owned(fitted), had_loss))
     }
 
@@ -809,6 +829,9 @@ impl RpcParameter {
             }
         }
         Self::write_crypto_metadata(packet_writer, &encrypted.metadata).await?;
+        if encrypted.had_conversion_loss {
+            packet_writer.note_code_page_conversion_loss();
+        }
         Ok(())
     }
 
@@ -985,6 +1008,9 @@ impl From<&SqlType> for TdsDataType {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
+    use crate::datatypes::sql_string::{EncodingType, SqlString};
     use crate::datatypes::sqltypes::SqlType;
     use crate::error::Error;
     use crate::message::parameters::rpc_parameters::{
@@ -1057,6 +1083,65 @@ mod tests {
         };
         assert_eq!(value.bytes, b"?");
         assert!(had_loss);
+    }
+
+    #[test]
+    fn encrypted_preencoded_narrow_value_stays_borrowed() {
+        let collation = SqlCollation {
+            info: 0x0409,
+            lcid_language_id: 0,
+            col_flags: 0,
+            sort_id: 52,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(SqlString::new(
+                    b"cafe".to_vec(),
+                    EncodingType::LcidBased(collation),
+                )),
+                4,
+            ),
+        );
+
+        let (value, had_loss) = parameter.value_for_encryption(&collation).unwrap();
+        assert!(matches!(value, Cow::Borrowed(_)));
+        assert!(!had_loss);
+    }
+
+    #[test]
+    fn explicit_limit_cannot_relax_rpc_declaration() {
+        let collation = SqlCollation {
+            info: 0,
+            lcid_language_id: 0,
+            col_flags: 0x40,
+            sort_id: 0,
+        };
+        let parameter = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(Some(SqlString::from_utf8_string("ab".to_string())), 1),
+        )
+        .with_narrow_string_byte_limit(2);
+
+        assert!(matches!(
+            parameter.validate_before_send(&collation),
+            Err(Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            })
+        ));
+
+        let mut mock = MockNetworkWriter::new(256);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        assert!(matches!(
+            block_on(parameter.serialize(&mut writer, &collation, false, &GenericEncoder::new())),
+            Err(Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            })
+        ));
     }
 
     /// A UDT is declared by its own server-side name, not the TDS type name
@@ -1209,7 +1294,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::Int(Some(5)),
         );
-        param.set_encrypted(Some(vec![0xAA, 0xBB, 0xCC, 0xDD]), sample_metadata());
+        param.set_encrypted(Some(vec![0xAA, 0xBB, 0xCC, 0xDD]), sample_metadata(), false);
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
         expected.push(0x08); // status: ENCRYPTED
@@ -1223,6 +1308,33 @@ mod tests {
         assert_eq!(serialize_param(&param), expected);
     }
 
+    #[test]
+    fn encrypted_conversion_loss_is_carried_by_the_rpc_message() {
+        let mut param = RpcParameter::new(
+            Some("@p".to_string()),
+            StatusFlags::NONE,
+            SqlType::Varchar(
+                Some(crate::datatypes::sql_string::SqlString::from_utf8_string(
+                    "日".to_string(),
+                )),
+                1,
+            ),
+        );
+        param.set_encrypted(Some(vec![0xAA]), sample_metadata(), true);
+
+        let mut mock = MockNetworkWriter::new(256);
+        let mut writer = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);
+        block_on(param.serialize(
+            &mut writer,
+            &SqlCollation::default(),
+            false,
+            &GenericEncoder::new(),
+        ))
+        .unwrap();
+
+        assert!(writer.code_page_conversion_loss());
+    }
+
     /// An encrypted `bit` parameter writes its base TYPE_INFO as `BITN(1)`
     /// (0x68, 0x01), not the `INTN(1)` (0x26, 0x01 = tinyint) the normal RPC
     /// path uses. Always Encrypted does no implicit conversion, so an `INTN(1)`
@@ -1234,7 +1346,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::Bit(Some(true)),
         );
-        param.set_encrypted(Some(vec![0xAA, 0xBB]), sample_metadata());
+        param.set_encrypted(Some(vec![0xAA, 0xBB]), sample_metadata(), false);
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00]; // name: len 2, "@p" UTF-16LE
         expected.push(0x08); // status: ENCRYPTED
@@ -1257,7 +1369,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::Int(None),
         );
-        param.set_encrypted(None, sample_metadata());
+        param.set_encrypted(None, sample_metadata(), false);
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
         expected.push(0x08); // status: ENCRYPTED
@@ -1281,7 +1393,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::VarBinaryMax(None),
         );
-        param.set_encrypted(Some(ciphertext.clone()), sample_metadata());
+        param.set_encrypted(Some(ciphertext.clone()), sample_metadata(), false);
 
         let mut expected = vec![0x02, 0x40, 0x00, 0x70, 0x00];
         expected.push(0x08); // status: ENCRYPTED
@@ -1306,7 +1418,7 @@ mod tests {
             StatusFlags::BY_REF_VALUE,
             SqlType::Int(Some(5)),
         );
-        param.set_encrypted(Some(vec![0x01]), sample_metadata());
+        param.set_encrypted(Some(vec![0x01]), sample_metadata(), false);
 
         let bytes = serialize_param(&param);
         // Status byte follows the 5-byte name prefix.
@@ -1324,7 +1436,7 @@ mod tests {
             StatusFlags::NONE,
             SqlType::Int(Some(5)),
         );
-        param.set_encrypted(Some(vec![9, 9]), sample_metadata());
+        param.set_encrypted(Some(vec![9, 9]), sample_metadata(), false);
         let stored: &EncryptedRpcValue = param.encrypted.as_ref().expect("encrypted set");
         assert_eq!(stored.ciphertext.as_deref(), Some(&[9u8, 9][..]));
         assert_eq!(stored.metadata.cek_id, 11);
@@ -1669,7 +1781,7 @@ mod tests {
             StatusFlags::NONE,
             StreamedSqlType::VarBinaryMax,
         );
-        param.set_encrypted(Some(vec![0x01, 0x02]), sample_metadata());
+        param.set_encrypted(Some(vec![0x01, 0x02]), sample_metadata(), false);
 
         let mut mock = MockNetworkWriter::new(16384);
         let mut w = PacketWriter::new(PacketType::RpcRequest, &mut mock, None, None);

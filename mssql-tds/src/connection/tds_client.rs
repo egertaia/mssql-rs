@@ -2434,6 +2434,7 @@ impl TdsClient {
             if param.name.is_none() {
                 return Err(UsageError("Streamed parameters must be named.".to_string()));
             }
+            param.validate_streamed_configuration()?;
         }
 
         Ok((streamed_params, materialized_params))
@@ -4758,7 +4759,7 @@ impl TdsClient {
                 param_refs.extend(params.iter_mut());
             }
             let database_collation = self.negotiated_settings.database_collation;
-            let had_conversion_loss = Self::apply_parameter_encryption(
+            Self::apply_parameter_encryption(
                 &describe,
                 &providers,
                 &cek_cache,
@@ -4768,9 +4769,6 @@ impl TdsClient {
                 &database_collation,
             )
             .await?;
-            if had_conversion_loss {
-                self.note_code_page_conversion_loss();
-            }
         }
 
         let database_collation = self.negotiated_settings.database_collation;
@@ -6354,7 +6352,7 @@ impl TdsClient {
 
         let (providers, cek_cache, trusted_key_paths) = self.cloned_ce_key_material()?;
         let database_collation = self.negotiated_settings.database_collation;
-        let had_conversion_loss = Self::apply_parameter_encryption(
+        Self::apply_parameter_encryption(
             &describe,
             &providers,
             &cek_cache,
@@ -6364,9 +6362,6 @@ impl TdsClient {
             &database_collation,
         )
         .await?;
-        if had_conversion_loss {
-            self.note_code_page_conversion_loss();
-        }
         Ok(describe)
     }
 
@@ -6486,7 +6481,7 @@ impl TdsClient {
         output_param_ceks: &mut HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>,
         trusted_key_paths: &[String],
         database_collation: &SqlCollation,
-    ) -> TdsResult<bool> {
+    ) -> TdsResult<()> {
         use crate::message::parameters::rpc_parameters::RpcEncryptionMetadata;
         use crate::security::encryption::encrypt_parameter;
         use crate::security::keystore::decrypt_cek;
@@ -6535,10 +6530,9 @@ impl TdsClient {
 
         // Nothing to do when the server reports no encrypted parameters.
         if !describe.parameters.iter().any(|p| p.is_encrypted()) {
-            return Ok(false);
+            return Ok(());
         }
 
-        let mut had_conversion_loss = false;
         for info in &describe.parameters {
             if !info.is_encrypted() {
                 continue;
@@ -6599,8 +6593,6 @@ impl TdsClient {
                 info.encryption_type,
                 info.normalization_rule_version,
             )?;
-            had_conversion_loss |= value_had_conversion_loss;
-
             param.set_encrypted(
                 ciphertext,
                 RpcEncryptionMetadata {
@@ -6612,9 +6604,10 @@ impl TdsClient {
                     cek_md_version: cek_entry.cek_md_version,
                     normalization_rule_version: info.normalization_rule_version,
                 },
+                value_had_conversion_loss,
             );
         }
-        Ok(had_conversion_loss)
+        Ok(())
     }
 
     /// Builds the `@tsql` and `@params` arguments for
@@ -18922,6 +18915,27 @@ mod tests {
             .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
             .await
             .expect_err("unnamed data-at-exec parameter must be rejected");
+        assert!(matches!(err, UsageError(_)));
+        assert!(matches!(
+            client.streamed_write_state,
+            StreamedWriteState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn begin_rejects_encoded_byte_limit_on_data_at_exec_param() {
+        let mut client = create_test_client_with_tokens(vec![]);
+        let bad = RpcParameter::data_at_exec(
+            Some("@v".to_string()),
+            StatusFlags::NONE,
+            StreamedSqlType::VarcharMax,
+        )
+        .with_narrow_string_byte_limit(1);
+
+        let err = client
+            .begin_sp_executesql("INSERT INTO t(v) VALUES (@v)".to_string(), vec![bad], ())
+            .await
+            .expect_err("streamed encoded-byte limits must be rejected before opening the RPC");
         assert!(matches!(err, UsageError(_)));
         assert!(matches!(
             client.streamed_write_state,

@@ -4401,6 +4401,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn transcode_does_not_carry_invalid_utf8_prefixes() {
+        let transcode = DaeTranscode::new(SQL_C_CHAR, SQL_WVARCHAR, SqlCollation::default());
+        for prefix in [[0xF0, 0x80], [0xED, 0xA0]] {
+            let mut carry = Vec::new();
+            let output = transcode.push(&mut carry, &prefix).bytes;
+            assert!(carry.is_empty(), "invalid prefix must not be carried");
+            assert_eq!(output, vec![0xFD, 0xFF, 0xFD, 0xFF]);
+        }
+    }
+
     /// A wide buffer feeding a narrow target has its own boundaries: half a
     /// code unit, and a surrogate pair split down the middle.
     ///

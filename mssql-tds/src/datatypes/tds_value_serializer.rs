@@ -113,6 +113,18 @@ impl TdsTypeContext {
 pub struct TdsValueSerializer;
 
 impl TdsValueSerializer {
+    fn narrow_string_maximum(
+        ctx: &TdsTypeContext,
+        narrow_string_byte_limit: Option<usize>,
+    ) -> Option<usize> {
+        match (narrow_string_byte_limit, ctx.is_plp) {
+            (Some(maximum), false) => Some(maximum.min(ctx.max_size)),
+            (Some(maximum), true) => Some(maximum),
+            (None, false) => Some(ctx.max_size),
+            (None, true) => None,
+        }
+    }
+
     /// Serialize a value using the provided type context.
     ///
     /// This writes ONLY the value portion:
@@ -163,10 +175,8 @@ impl TdsValueSerializer {
             return Ok(());
         }
 
-        let maximum = match narrow_string_byte_limit {
-            Some(maximum) => maximum,
-            None if !ctx.is_plp => ctx.max_size,
-            None => return Ok(()),
+        let Some(maximum) = Self::narrow_string_maximum(ctx, narrow_string_byte_limit) else {
+            return Ok(());
         };
         Self::narrow_string_bytes(value, ctx, Some(maximum))?;
         Ok(())
@@ -184,7 +194,7 @@ impl TdsValueSerializer {
             return Ok(None);
         }
 
-        let maximum = narrow_string_byte_limit.or_else(|| (!ctx.is_plp).then_some(ctx.max_size));
+        let maximum = Self::narrow_string_maximum(ctx, narrow_string_byte_limit);
         if let Some(bytes) = value.as_raw_wire_bytes() {
             let bytes = match maximum {
                 Some(maximum) => Self::fit_narrow_bytes(bytes, maximum)?,
@@ -1949,7 +1959,7 @@ impl TdsValueSerializer {
     where
         'b: 'a,
     {
-        let maximum = narrow_string_byte_limit.or_else(|| (!ctx.is_plp).then_some(ctx.max_size));
+        let maximum = Self::narrow_string_maximum(ctx, narrow_string_byte_limit);
         let single_byte_data = match maximum {
             Some(maximum) => Self::fit_narrow_bytes(single_byte_data, maximum)?,
             None => single_byte_data,
@@ -4627,6 +4637,31 @@ mod tests {
             Err(Error::EncodedValueTooLong {
                 actual: 3,
                 maximum: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn explicit_limit_cannot_relax_non_plp_declaration() {
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            utf16le("ab"),
+            crate::datatypes::sql_string::EncodingType::Utf16,
+        ));
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: 1,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: Some(utf8_collation()),
+            is_nullable: true,
+        };
+        assert!(matches!(
+            TdsValueSerializer::validate_narrow_string_length(&value, &ctx, Some(2)),
+            Err(Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
             })
         ));
     }

@@ -144,7 +144,45 @@ impl TdsValueSerializer {
     where
         'b: 'a,
     {
+        Self::validate_row_narrow_string_length(value, ctx)?;
         Self::serialize_value_with_narrow_string_byte_limit(writer, value, ctx, None).await
+    }
+
+    fn validate_row_narrow_string_length(
+        value: &ColumnValues,
+        ctx: &TdsTypeContext,
+    ) -> TdsResult<()> {
+        let ColumnValues::String(value) = value else {
+            return Ok(());
+        };
+        if ctx.is_plp {
+            return Ok(());
+        }
+        let is_narrow = matches!(ctx.tds_type, VARCHAR | CHAR | TEXT)
+            || (ctx.tds_type == SQL_VARIANT
+                && matches!(
+                    value.encoding_type(),
+                    EncodingType::Utf8 | EncodingType::LcidBased(_)
+                ));
+        if !is_narrow {
+            return Ok(());
+        }
+
+        let actual = if let Some(bytes) = value.as_raw_wire_bytes() {
+            bytes.len()
+        } else {
+            let text = value.to_utf8_string();
+            Self::encode_narrow_for_wire(&text, ctx.collation)
+                .bytes
+                .len()
+        };
+        if actual > ctx.max_size {
+            return Err(Error::EncodedValueTooLong {
+                actual,
+                maximum: ctx.max_size,
+            });
+        }
+        Ok(())
     }
 
     #[inline]
@@ -4639,6 +4677,55 @@ mod tests {
                 maximum: 2
             })
         ));
+    }
+
+    #[test]
+    fn row_serialization_rejects_trailing_space_overflow() {
+        let value = ColumnValues::String(crate::datatypes::sql_string::SqlString::new(
+            b"a ".to_vec(),
+            crate::datatypes::sql_string::EncodingType::Utf8,
+        ));
+        let ctx = TdsTypeContext {
+            tds_type: VARCHAR,
+            max_size: 1,
+            is_plp: false,
+            is_fixed_length: false,
+            precision: None,
+            scale: None,
+            collation: Some(utf8_collation()),
+            is_nullable: true,
+        };
+
+        let mut row_mock = MockNetworkWriter::new(64);
+        let mut row_writer =
+            PacketWriter::new(PacketType::TabularResult, &mut row_mock, None, None);
+        let err = block_on(TdsValueSerializer::serialize_value(
+            &mut row_writer,
+            &value,
+            &ctx,
+        ))
+        .expect_err("bulk and TVP values must not use RPC trailing-space fitting");
+        assert!(matches!(
+            err,
+            Error::EncodedValueTooLong {
+                actual: 2,
+                maximum: 1
+            }
+        ));
+
+        let mut rpc_mock = MockNetworkWriter::new(64);
+        let mut rpc_writer =
+            PacketWriter::new(PacketType::TabularResult, &mut rpc_mock, None, None);
+        block_on(
+            TdsValueSerializer::serialize_value_with_narrow_string_byte_limit(
+                &mut rpc_writer,
+                &value,
+                &ctx,
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(payload(&rpc_writer), [1, 0, b'a']);
     }
 
     #[test]

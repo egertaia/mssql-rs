@@ -213,19 +213,14 @@ pub trait SecurityContext: Send + Sync {
     fn spn(&self) -> &str;
 }
 
-/// Creates the [`SecurityContext`] for integrated authentication, replacing the
-/// built-in SSPI (Windows) or GSSAPI (Linux/macOS) context.
+/// Replaces the built-in SSPI/GSSAPI [`SecurityContext`] for integrated auth,
+/// e.g. NTLM on Unix via the `sspi` crate. Like `SspiContextProvider` in
+/// Microsoft.Data.SqlClient.
 ///
-/// Set it on [`ClientContext::security_context_provider`](crate::connection::client_context::ClientContext::security_context_provider)
-/// to plug in a custom scheme, such as NTLM on Unix through the `sspi` crate.
-/// Equivalent to `SqlConnection.SspiContextProvider` in Microsoft.Data.SqlClient.
-///
-/// It is called once per connection attempt, after the TLS handshake, so
-/// `config.channel_bindings` carries the TLS channel binding token when the
-/// connection uses Extended Protection. `config.server_spn` is `None` unless the
-/// caller set one; [`make_spn`](super::make_spn) builds the default.
+/// Called once per login, after TLS, so `config.channel_bindings` is set when
+/// Extended Protection applies.
 pub trait SecurityContextProvider: Send + Sync {
-    /// Creates a security context for one authentication exchange with `server:port`.
+    /// Creates a context for one login to `server:port`.
     fn create_context(
         &self,
         config: &IntegratedAuthConfig,

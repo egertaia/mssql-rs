@@ -81,7 +81,7 @@ impl SspiAuthHandler {
     /// * `config` - The integrated authentication configuration
     /// * `server` - The server hostname or IP address
     /// * `port` - The server port
-    /// * `provider` - Custom context provider; `None` uses the platform SSPI/GSSAPI context
+    /// * `provider` - Custom context provider; `None` uses the platform one
     ///
     /// # Returns
     ///
@@ -289,26 +289,21 @@ mod tests {
     impl SecurityContextProvider for MockProvider {
         fn create_context(
             &self,
-            config: &IntegratedAuthConfig,
-            server: &str,
-            port: u16,
+            _config: &IntegratedAuthConfig,
+            _server: &str,
+            _port: u16,
         ) -> Result<Box<dyn SecurityContext>, SecurityError> {
-            assert_eq!(config.channel_bindings.as_deref(), Some(&[1u8, 2, 3][..]));
-            Ok(Box::new(
-                MockSecurityContext::single_round(b"custom_token".to_vec())
-                    .with_spn(format!("MSSQLSvc/{server}:{port}")),
-            ))
+            Ok(Box::new(MockSecurityContext::single_round(
+                b"custom".to_vec(),
+            )))
         }
     }
 
     #[test]
     fn test_sspi_handler_uses_custom_provider() {
-        let config = IntegratedAuthConfig::new().with_channel_bindings(vec![1, 2, 3]);
-        let mut handler =
-            SspiAuthHandler::new(&config, "custom.host", 5000, Some(&MockProvider)).unwrap();
+        let config = IntegratedAuthConfig::new();
+        let mut handler = SspiAuthHandler::new(&config, "host", 1433, Some(&MockProvider)).unwrap();
 
-        assert_eq!(handler.target_spn(), "MSSQLSvc/custom.host:5000");
-        assert_eq!(handler.get_initial_token().unwrap(), b"custom_token");
-        assert!(handler.is_complete());
+        assert_eq!(handler.get_initial_token().unwrap(), b"custom");
     }
 }

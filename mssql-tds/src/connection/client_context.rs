@@ -375,10 +375,7 @@ pub struct ClientContext {
     ///
     /// `None` writes the dialled address, which is the previous behaviour.
     pub login_server_name: Option<String>,
-    /// Custom security context provider for integrated authentication.
-    ///
-    /// When set, SSPI logins use it instead of the built-in SSPI (Windows) or
-    /// GSSAPI (Linux/macOS) context. `None` (the default) keeps the built-in one.
+    /// Overrides the built-in SSPI/GSSAPI context for integrated auth. Default: `None`.
     pub security_context_provider:
         Option<std::sync::Arc<dyn crate::security::SecurityContextProvider>>,
     pub(crate) transport_context: TransportContext,

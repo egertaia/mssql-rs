@@ -204,7 +204,7 @@ fn refresh_alias_types(dbc: &DbcHandle) {
         } => {
             let names = dbc
                 .runtime
-                .block_on(read_on_secondary(*context, timeout_secs));
+                .block_on(read_on_secondary(context, timeout_secs));
             let lookup = names.map(|names| AliasTypeCache {
                 catalog,
                 database_change_count,
@@ -264,21 +264,25 @@ fn prompts_for_sign_in(context: &ClientContext) -> bool {
 
 /// One deadline covers the login and the read. Without one, the login keeps
 /// the login timeout it inherits, which `SpawnConnection` also copies.
+///
+/// The caller polls this on the application's thread, so the login and read
+/// are boxed, as `create_client` boxes its connection, to leave room on small
+/// application stacks such as musl's 128 KiB threads.
 async fn read_on_secondary(
-    context: ClientContext,
+    context: Box<ClientContext>,
     timeout_secs: u32,
 ) -> TdsResult<HashMap<u32, String>> {
-    let lookup = async {
+    let lookup = Box::pin(async move {
         let data_source = context.data_source.clone();
         let mut client = TdsConnectionProvider::new()
-            .create_client(context, &data_source, None)
+            .create_client(*context, &data_source, None)
             .await?;
         debug!(
             client_connection_id = %client.client_connection_id(),
             "alias-type lookup: logged in separately"
         );
         read_alias_types(&mut client, 0).await
-    };
+    });
     if timeout_secs == 0 {
         return lookup.await;
     }
@@ -774,6 +778,19 @@ mod tests {
         publish(dbc, None, generation, Ok(names));
 
         assert_eq!(dbc.inner.lock().unwrap().alias_types, None);
+    }
+
+    /// The caller polls the secondary login on the application's thread, so
+    /// its future stays within the bound `create_client`'s connection future
+    /// keeps for small application stacks.
+    #[test]
+    fn secondary_lookup_future_stays_small() {
+        const MAX: usize = 4096;
+        let size = std::mem::size_of_val(&read_on_secondary(Box::default(), 1));
+        assert!(
+            size <= MAX,
+            "secondary lookup future is {size} B, expected <= {MAX} B"
+        );
     }
 
     #[test]

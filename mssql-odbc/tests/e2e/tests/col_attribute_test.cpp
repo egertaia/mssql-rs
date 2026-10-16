@@ -255,7 +255,7 @@ private:
 // The first description happens with the cursor's rows pending, so the names
 // are read without touching the session that is serving them.
 //
-// Skipped under comparison: parity-deviations entry 29. msodbcsql's separate
+// Skipped under comparison: parity-deviations entry 31. msodbcsql's separate
 // login takes neither the session's encryption settings nor its DSN's, so
 // against a server that forces encryption with a certificate the client trusts
 // only through TrustServerCertificate, as CI's does, its lookup fails and the

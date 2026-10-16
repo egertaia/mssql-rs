@@ -924,6 +924,7 @@ msodbcsql build is measured.
     status and rows-processed pointers, and to every header-alias attribute
     plus `SQL_ROWSET_SIZE`, which is ARD-resident without being an alias and
     so reaches the same `readers_through` walk through `set_desc_header`.
+
 27. **Cancellation of a blocked `SQLMoreResults` reports `SQL_ERROR` / `HY008`
     rather than silently ending result navigation.** In the measured sequence
     (an unread large first row, `WAITFOR`, then a second result), native
@@ -991,7 +992,46 @@ msodbcsql build is measured.
     `sql_batch_starting` capture with the `client_connection_id` action reported
     the identical GUID; the deterministic PRELOGIN test pins the byte order
     and the connection/activity field order independently.
-29. **A busy connection's alias-type lookup logs in with the session's own
+
+29. **A large XML input supplied through data-at-execution treats its
+    `ColumnSize` as unlimited.** msodbcsql rejects `SQL_SS_XML` above 4,000 with
+    `HY104`: `CheckSqlPrec`'s `SQL_XML_MAPPED` arm uses the
+    `SQL_PREC_NCHAR` ceiling (`Sql/Ntdbms/sqlncli/odbc/sqlcdesc.cpp`), reached
+    from `SQLBindParameter` through `CheckSqlPrecScale<TRUE>`. This driver keeps
+    that result for materialized XML, but admits an input or input/output
+    binding above the ceiling because `StrLen_or_IndPtr` is deferred input and
+    need not be initialized until execution. The original `ColumnSize` remains
+    in the descriptor and is revalidated against the positioned execution-time
+    indicator: data-at-execution values use unlimited XML semantics, including
+    when a mixed DAE sequence must collect an earlier value to preserve bind
+    order. A non-DAE materialized value reports `HY104` from
+    `SQLExecute`/`SQLExecDirect` rather than from `SQLBindParameter`.
+
+    mssql-python preserves the caller's `setinputsizes((SQL_SS_XML, n, 0))`
+    size when it switches values above 4,000 to data-at-execution. Rejecting
+    that shape prevents the PLP streaming path from running at all, while XML
+    has no bounded TDS declaration to preserve. The exception is limited to
+    input and input/output bindings, and execution-time revalidation keeps
+    ordinary oversized materialized values rejected. `LargeXmlStreamsThroughDataAtExecution`
+    covers the consumer's binding shape and is skipped on the comparison leg
+    because the reference driver rejects it. Tracked in AB#48349.
+
+30. **A streamed XML value that already starts with a UTF-16LE byte-order mark
+    keeps exactly one mark; msodbcsql sends two.** msodbcsql's
+    `ConvertLongData` uses `fPrependXmlBOM` (`odbc/sqlccnvt.cpp:879-911`),
+    selected by `WAITING_FOR_DATA` on the first `SQLPutData` call
+    (`odbc/sqlccmd.cpp:4860-4876`), to prepend `XML_BOM_BYTES` before forwarding
+    the application's bytes unchanged. It does not inspect those bytes, so an
+    application-supplied `FF FE` follows the driver's `FF FE`.
+
+    This driver buffers at most the first two XML bytes across `SQLPutData`
+    calls. It emits one `FF FE` itself and suppresses the buffered bytes only
+    when they are the same mark. This matches the materialized XML serializer,
+    avoids a duplicate XML declaration marker, and preserves all non-BOM input.
+    Wire-level tests cover an absent BOM, a BOM split across calls, and later
+    chunks after BOM classification. Tracked in AB#48349.
+
+31. **A busy connection's alias-type lookup logs in with the session's own
     authentication and encryption settings.** Both drivers read alias type
     names for `SQL_DESC_TYPE_NAME` and `SQL_DESC_LOCAL_TYPE_NAME` on the session
     when it is idle, and on a separate login while rows are pending
@@ -1033,7 +1073,8 @@ msodbcsql build is measured.
     reading only. The same test on an Entra-authenticated connection with
     `SQL_DRIVER_VER` recorded would close it. Tracked in AB#48044. Human parity
     sign-off has not been recorded.
-30. **`SQL_ATTR_CONNECTION_TIMEOUT` bounds a busy connection's alias-type
+
+32. **`SQL_ATTR_CONNECTION_TIMEOUT` bounds a busy connection's alias-type
     lookup, its login included.** msodbcsql bounds the lookup on an idle
     session with the connection timeout (`GetNetIOTimeOut`), but on a busy one
     `RefreshShilohUDTCache` (`sqlccmd.cpp`) reads the timeout of the connection

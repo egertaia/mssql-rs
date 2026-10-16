@@ -171,7 +171,7 @@ fn refresh_alias_types(dbc: &DbcHandle) {
         // session the same way (`GetNetIOTimeOut`), but on a spawned
         // connection it reads that connection's timeout, which is unset, so
         // its lookup can wait forever behind the session's own uncommitted
-        // type change (parity-deviations entry 30).
+        // type change (parity-deviations entry 32).
         (state.session_generation, state.connection_timeout, route)
     };
 

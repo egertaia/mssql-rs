@@ -26,10 +26,12 @@ use crate::handles::{HandleType, StmtHandle, handle_from_raw, process_is_shuttin
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_close_cursor(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLCloseCursor called");
-    crate::ffi_entry!("SQLCloseCursor", unsafe {
-        sql_close_cursor_impl(statement_handle)
-    })
+    crate::ffi_entry!(
+        "SQLCloseCursor",
+        statement_handle,
+        debug!(?statement_handle, "SQLCloseCursor called"),
+        unsafe { sql_close_cursor_impl(statement_handle) }
+    )
 }
 
 /// Implements the `SQL_CLOSE` option of `SQLFreeStmt` — closes the cursor
@@ -41,10 +43,12 @@ pub(crate) unsafe fn sql_close_cursor(statement_handle: SqlHandle) -> SqlReturn 
 /// # Safety
 /// `statement_handle` must be a valid `StmtHandle` or null.
 pub(crate) unsafe fn sql_free_stmt_close(statement_handle: SqlHandle) -> SqlReturn {
-    debug!(?statement_handle, "SQLFreeStmt(SQL_CLOSE) called");
-    crate::ffi_entry!("SQLFreeStmt(SQL_CLOSE)", unsafe {
-        sql_free_stmt_close_impl(statement_handle)
-    })
+    crate::ffi_entry!(
+        "SQLFreeStmt(SQL_CLOSE)",
+        statement_handle,
+        debug!(?statement_handle, "SQLFreeStmt(SQL_CLOSE) called"),
+        unsafe { sql_free_stmt_close_impl(statement_handle) }
+    )
 }
 
 /// # Safety
@@ -60,6 +64,10 @@ unsafe fn sql_close_cursor_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_close_cursor_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let _operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLCloseCursor: stmt mutex poisoned");
         return SQL_ERROR;
@@ -119,6 +127,10 @@ unsafe fn sql_free_stmt_close_impl(statement_handle: SqlHandle) -> SqlReturn {
 }
 
 fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> SqlReturn {
+    let _operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
     let Ok(mut stmt_state) = stmt.inner.lock() else {
         error!("SQLFreeStmt(SQL_CLOSE): stmt mutex poisoned");
         return SQL_ERROR;
@@ -181,6 +193,10 @@ fn sql_free_stmt_close_safe(statement_handle: SqlHandle, stmt: &StmtHandle) -> S
 /// request next is unsafe, which an already-closed batch's stale diagnostic
 /// does not make true.
 pub(super) fn close_cursor_for_connection_op(stmt: &StmtHandle, handle: SqlHandle) -> SqlReturn {
+    let _operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
     let pending_fetch_error = {
         let Ok(mut stmt_state) = stmt.inner.lock() else {
             error!("close_cursor_for_connection_op: stmt mutex poisoned");

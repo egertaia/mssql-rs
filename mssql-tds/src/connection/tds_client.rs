@@ -752,6 +752,9 @@ impl TdsClient {
         client_context: ClientContext,
         login_session_state_tokens: Vec<SessionStateToken>,
     ) -> Self {
+        if let Some(trace) = &client_context.connection_trace {
+            trace.establish(negotiated_settings.client_connection_id);
+        }
         let mut recovery_context = RecoveryContext::new();
         recovery_context.initialize(
             client_context,
@@ -1042,6 +1045,14 @@ impl TdsClient {
         // response report the reset as unacknowledged and discard a healthy,
         // brand-new connection.
         self.reset_state = ResetAckState::Idle;
+        if let Some(trace) = self
+            .recovery_context
+            .client_context
+            .as_ref()
+            .and_then(|context| context.connection_trace.as_ref())
+        {
+            trace.establish(self.negotiated_settings.client_connection_id);
+        }
         Ok(())
     }
 
@@ -1139,6 +1150,7 @@ impl TdsClient {
             Tokens::Sspi(_) => "Sspi",
             Tokens::Row(_) => "Row",
             Tokens::ColMetadata(_) => "ColMetadata",
+            Tokens::DataClassification(_) => "DataClassification",
             Tokens::Order(_) => "Order",
             Tokens::ReturnStatus(_) => "ReturnStatus",
             Tokens::ReturnValue(_) => "ReturnValue",
@@ -1354,6 +1366,12 @@ impl TdsClient {
     /// (`@@SERVERNAME`), which is not necessarily the host the client dialled.
     pub fn server_reported_name(&self) -> Option<&str> {
         self.negotiated_settings.server_reported_name.as_deref()
+    }
+
+    /// The GUID sent in PRELOGIN for the current physical connection.
+    /// Changes after transparent recovery, but not after a pool reset.
+    pub fn client_connection_id(&self) -> uuid::Uuid {
+        self.negotiated_settings.client_connection_id
     }
 
     /// Returns the character-set name the server sent in the login
@@ -1574,7 +1592,9 @@ impl TdsClient {
         };
 
         let start = Instant::now();
-        self.reconnect(reconnect_timeout, cancel_handle).await?;
+        // Keep the login/recovery state out of every command's future. Allocate
+        // only after detecting a dead connection, not on the healthy hot path.
+        Box::pin(self.reconnect(reconnect_timeout, cancel_handle)).await?;
         Ok(start.elapsed())
     }
 
@@ -2592,6 +2612,7 @@ impl TdsClient {
         .await;
         let message = packet_writer.suspend();
 
+        let result = result.and_then(|()| message.check_cancellation());
         match result {
             Ok(()) => {
                 // Chunk framed cleanly: re-park the message so the next chunk or
@@ -2610,16 +2631,7 @@ impl TdsClient {
                 Ok(())
             }
             Err(e) => {
-                // A partial value chunk is now on the wire, so this message can no
-                // longer be continued safely. Drop it and abort the streamed
-                // write rather than re-parking it as resumable.
-                let send_incomplete = message.send_incomplete();
-                drop(message);
-                if send_incomplete {
-                    self.retire_without_writing();
-                } else {
-                    self.abort_streamed_write().await;
-                }
+                self.retract_partial_request(message).await;
                 Err(e)
             }
         }
@@ -2746,23 +2758,20 @@ impl TdsClient {
             // instead, which is msodbcsql's `STATE_BATCH_CMDSENT` arm. The
             // transport marks itself dead if the attention goes unacknowledged.
             //
-            // Bounded by `ATTENTION_TIMEOUT_SECONDS`, not `CANCEL_TIMEOUT`:
-            // msodbcsql passes its 120s cancel budget here too, but an ACK that
-            // has not arrived in 5s is not coming, and the bulk-load abort takes
-            // the same bound for the same reason.
-            //
             // Dropped rather than abandoned: this message carried its reset bit
             // all the way out and `note_reset_dispatched` recorded it, so the
             // acknowledgement is already being tracked. Re-arming would send it
             // twice.
+            let timeout = message
+                .cancellation_deadline()
+                .map_or(Duration::from_secs(ATTENTION_TIMEOUT_SECONDS), |deadline| {
+                    deadline.saturating_duration_since(tokio::time::Instant::now())
+                });
             drop(message);
             // `send_attention_and_wait` logs its own timeouts, but the write
             // failure path returns without logging - and that is the one that
             // costs a connection.
-            if let Err(error) = self
-                .send_attention_with_timeout(Duration::from_secs(ATTENTION_TIMEOUT_SECONDS))
-                .await
-            {
+            if let Err(error) = self.send_attention_with_timeout(timeout).await {
                 warn!(%error, "Failed to cancel a fully sent request");
             }
             return;
@@ -2783,10 +2792,8 @@ impl TdsClient {
         }
     }
 
-    /// Closes an already-sent message with `EOM | IGNORE`, allowing 60 seconds
-    /// for the write and then 120 seconds to consume its DONE. A stalled write
-    /// hits the 120-second outer deadline and skips the drain. msodbcsql instead
-    /// allows 120 seconds for each sequential leg.
+    /// Withdraws with `EOM | IGNORE`. A configured cancellation budget covers
+    /// the write and drain together; otherwise the historical TDS limits apply.
     async fn withdraw_sent_message(&mut self, message: SuspendedMessage) -> Withdrawal {
         // Cached read, not `is_connection_dead`: that one `try_read`s a byte,
         // which here could swallow the server's answer to the half-written
@@ -2801,10 +2808,15 @@ impl TdsClient {
         // Read before `resume` takes it: the server discards an ignored message
         // whole, so a reset bit already on the wire has to ride a later request.
         let carried_reset = message.reset_mode();
+        let deadline = message.cancellation_deadline();
 
         let mut packet_writer = PacketWriter::resume(
             message
-                .with_write_timeout(Some(CANCEL_WRITE_TIMEOUT_SECS))
+                .with_write_timeout(if deadline.is_some() {
+                    None
+                } else {
+                    Some(CANCEL_WRITE_TIMEOUT_SECS)
+                })
                 .without_cancellation(),
             self.transport.as_writer(),
         );
@@ -2812,8 +2824,11 @@ impl TdsClient {
         // ignore packet needs an outer deadline too. Reaching that one means the
         // write never came back, so the future is dropped mid-record and the
         // transport is retired without being written to again.
-        let ignored =
-            tokio::time::timeout(CANCEL_TIMEOUT, packet_writer.cancel_current_message()).await;
+        let ignored = tokio::time::timeout_at(
+            deadline.unwrap_or_else(|| tokio::time::Instant::now() + CANCEL_TIMEOUT),
+            packet_writer.cancel_current_message(),
+        )
+        .await;
         let message = packet_writer.suspend();
         let send_incomplete = message.send_incomplete();
         drop(message);
@@ -2834,9 +2849,26 @@ impl TdsClient {
 
         // The server acknowledges an ignored message with a DONE. Leaving it
         // unread would desynchronize the next command.
-        let saved_timeout = self.remaining_request_timeout.replace(CANCEL_TIMEOUT);
+        let budget = deadline.map_or(CANCEL_TIMEOUT, |deadline| {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        });
+        let saved_timeout = self.remaining_request_timeout.replace(budget);
         let saved_cancel = self.cancel_handle.take();
-        let drained = self.drain_stream().await;
+        let drained = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, self.drain_stream()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.retire_without_writing();
+                    Err(crate::error::Error::TimeoutError(
+                        crate::error::TimeoutErrorType::String(
+                            "Timed out draining an ignored request".to_string(),
+                        ),
+                    ))
+                }
+            }
+        } else {
+            self.drain_stream().await
+        };
         self.cancel_handle = saved_cancel;
         self.remaining_request_timeout = saved_timeout;
         match drained {
@@ -3110,6 +3142,8 @@ impl TdsClient {
             }
         }
 
+        let write_outcome =
+            write_outcome.and_then(|next| message.check_cancellation().map(|()| next));
         match write_outcome {
             // Another streamed parameter is now open for data.
             Ok(Some(next_name)) => {
@@ -3130,9 +3164,8 @@ impl TdsClient {
                 })
             }
             // Last streamed parameter closed and the message was sent: consume
-            // the response exactly like execute_sp_executesql does. A failure
-            // reading the response also aborts (the request is already on the
-            // wire, so the connection must be reset before reuse).
+            // the response exactly like execute_sp_executesql does. An
+            // acknowledged ATTENTION costs only this request, not the session.
             Ok(None) => {
                 // The materialized parameters in this message's prefix were
                 // serialized calls ago; the flag rode along on the suspended
@@ -3145,7 +3178,9 @@ impl TdsClient {
                 match self.position_on_first_result().await {
                     Ok(result) => Ok(StreamedParamStatus::Complete(result)),
                     Err(e) => {
-                        self.abort_streamed_write().await;
+                        if !self.take_settled_drain_interruption(&e) {
+                            self.abort_streamed_write().await;
+                        }
                         Err(e)
                     }
                 }
@@ -3940,11 +3975,18 @@ impl TdsClient {
         let Some(id) = *orphaned else {
             return Ok(());
         };
+        let cancel = options.cancel;
         let result = self.execute_sp_unprepare(id, true, options).await;
         if !self.prepared_handles.contains_key(&id) {
             *orphaned = None;
         }
-        result
+        result?;
+        if cancel.is_some_and(|handle| handle.cancel_token.is_cancelled()) {
+            return Err(crate::error::Error::OperationCancelledError(
+                "Request was cancelled during orphan cleanup".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Executes `statement`, transparently recovering the connection and
@@ -4105,6 +4147,15 @@ impl TdsClient {
         let declaration_params = first_params.clone();
         RpcParameter::reject_data_at_exec(declaration_params.iter())?;
         let mut opts = options.into();
+        // Do not start cleanup for an already-cancelled batch.
+        if opts
+            .cancel
+            .is_some_and(|handle| handle.cancel_token.is_cancelled())
+        {
+            return Err(crate::error::Error::OperationCancelledError(
+                "Request was cancelled before starting its prepared batch".to_string(),
+            ));
+        }
         self.current_command_ce_setting = opts.column_encryption;
         if self.should_encrypt_parameters() {
             return Err(UsageError(
@@ -4251,6 +4302,7 @@ impl TdsClient {
             let remaining = Self::deduct_timeout(opts.timeout, started.elapsed()).into_timeout()?;
             timeout_sec = remaining.seconds();
             self.remaining_request_timeout = remaining.duration();
+            self.cancel_handle = opts.cancel.map(CancelHandle::child_handle);
         }
 
         let live_handle = statement
@@ -4780,6 +4832,16 @@ impl TdsClient {
     #[doc(hidden)]
     pub fn set_database_collation_for_test(&mut self, collation: SqlCollation) {
         self.negotiated_settings.database_collation = collation;
+    }
+
+    /// Data Classification version negotiated at login, as its wire value.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn negotiated_data_classification_version_for_test(&self) -> Option<u8> {
+        self.negotiated_settings
+            .session_settings
+            .data_classification_version()
+            .map(|version| version as u8)
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -5620,6 +5682,11 @@ impl TdsClient {
                     continue;
                 }
                 Tokens::TabName | Tokens::ColInfo => {
+                    continue;
+                }
+                // Parsed with the negotiated version; result-set attachment is
+                // not implemented yet, so the metadata is not surfaced.
+                Tokens::DataClassification(_) => {
                     continue;
                 }
                 _ => {
@@ -8167,6 +8234,9 @@ impl TdsClient {
                 Ok(None)
             }
             Tokens::TabName | Tokens::ColInfo => Ok(None),
+            // Sent between COLMETADATA and the first row. Parsed with the
+            // negotiated version; result-set attachment is not implemented yet.
+            Tokens::DataClassification(_) => Ok(None),
             _ => Err(crate::error::Error::ProtocolError(format!(
                 "Unexpected token while finding the next row: {token:?}"
             ))),
@@ -8884,7 +8954,10 @@ impl TdsClient {
             TransactionManagementRequest::new(transaction_params, &self.execution_context);
         let mut packet_writer =
             transaction.create_packet_writer(self.transport.as_writer(), timeout_sec, cancel);
-        transaction.serialize(&mut packet_writer).await?;
+        let sent = transaction.serialize(&mut packet_writer).await;
+        let message = packet_writer.suspend();
+        drop(transaction);
+        self.finish_send(sent, message).await?;
 
         self.consume_transaction_response().await?;
 
@@ -9922,6 +9995,45 @@ mod tests {
     }
 
     #[test]
+    fn client_connection_id_tracks_physical_sessions_not_pool_resets() {
+        use crate::handler::handler_factory::create_test_negotiated_settings_internal;
+        use crate::trace_context::ConnectionTrace;
+
+        let trace = Arc::new(ConnectionTrace::default());
+        let mut context = ClientContext::default();
+        context.set_connection_trace(Arc::clone(&trace));
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let mut settings = create_test_negotiated_settings_internal();
+        settings.client_connection_id = first;
+        let mut client = TdsClient::new(
+            AnyTransport::dynamic(TestTransport::new()),
+            settings,
+            ExecutionContext::new(),
+            context,
+            Vec::new(),
+        );
+        assert_eq!(client.client_connection_id(), first);
+        assert_eq!(trace.client_connection_id(), Some(first));
+        client.prepare_reset_connection(false);
+        assert_eq!(client.client_connection_id(), first);
+        assert_eq!(trace.client_connection_id(), Some(first));
+        let mut recovered = create_test_negotiated_settings_internal();
+        recovered.client_connection_id = second;
+        client
+            .adopt_recovered_session(
+                AnyTransport::dynamic(TestTransport::new()),
+                recovered,
+                ExecutionContext::new(),
+                Vec::new(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(client.client_connection_id(), second);
+        assert_eq!(trace.client_connection_id(), Some(second));
+    }
+
+    #[test]
     fn session_recovery_wiring_from_negotiated_settings() {
         use crate::message::features::session_recovery::SessionRecoveryFeature;
         use crate::message::login::Feature;
@@ -10019,6 +10131,49 @@ mod tests {
         for (name, size) in [
             ("ResultSet::next_row", result_set_next_row),
             ("ResultSet::next_row_into", result_set_next_row_into),
+        ] {
+            assert!(
+                size <= MAX,
+                "{name} future is {size} B, expected <= {MAX} B"
+            );
+        }
+    }
+
+    // A cold reconnect future used to inflate all command futures, overflowing
+    // musl's 128 KiB application-thread stack through ODBC's block_on calls.
+    #[test]
+    fn command_futures_stay_small() {
+        const MAX: usize = 8192;
+        let mut client = create_test_client();
+        let mut prepared = PreparedStatement::new(String::new());
+        let mut orphaned = None;
+
+        let reconnect = std::mem::size_of_val(&client.check_and_reconnect(None, None));
+        assert!(reconnect <= 128, "reconnect check future is {reconnect} B");
+        let execute = std::mem::size_of_val(&client.execute(String::new(), ()));
+        let execute_sp_executesql =
+            std::mem::size_of_val(&client.execute_sp_executesql(String::new(), Vec::new(), ()));
+        let begin_sp_executesql =
+            std::mem::size_of_val(&client.begin_sp_executesql(String::new(), Vec::new(), ()));
+        let execute_stored_procedure =
+            std::mem::size_of_val(&client.execute_stored_procedure(String::new(), None, None, ()));
+        let execute_prepared = std::mem::size_of_val(&client.execute_prepared(
+            &mut prepared,
+            Vec::new(),
+            &mut orphaned,
+            (),
+        ));
+        let begin_transaction = std::mem::size_of_val(
+            &client.begin_transaction(TransactionIsolationLevel::NoChange, None),
+        );
+
+        for (name, size) in [
+            ("execute", execute),
+            ("execute_sp_executesql", execute_sp_executesql),
+            ("begin_sp_executesql", begin_sp_executesql),
+            ("execute_stored_procedure", execute_stored_procedure),
+            ("execute_prepared", execute_prepared),
+            ("begin_transaction", begin_transaction),
         ] {
             assert!(
                 size <= MAX,
@@ -10299,6 +10454,81 @@ mod tests {
         // Ending the request clears it, including when the walk already ended.
         client.close_query().await.unwrap();
         assert_eq!(client.last_result_row_count(), None);
+    }
+
+    /// A DATACLASSIFICATION token follows COLMETADATA. It is parsed but not yet
+    /// attached to the result set, so neither the row loop nor the walk between
+    /// results may treat it as the end of a result or an unexpected token.
+    #[tokio::test]
+    async fn data_classification_tokens_do_not_disturb_result_set_navigation() {
+        use crate::token::data_classification::{
+            DataClassificationMetadata, DataClassificationVersion, SensitivityRank,
+        };
+        fn classification() -> Tokens {
+            Tokens::DataClassification(DataClassificationMetadata {
+                version: DataClassificationVersion::Version2,
+                sensitivity_labels: Vec::new(),
+                information_types: Vec::new(),
+                rank: Some(SensitivityRank::NotDefined),
+                columns: Vec::new(),
+            })
+        }
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, true),
+            classification(),
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            client.execute("q".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::Rows);
+        assert!(client.next_row().await.unwrap().is_none());
+        assert_eq!(client.advance().await.unwrap(), StatementResult::End);
+        assert!(!client.is_connection_dead());
+    }
+
+    /// Closing a classified result set before reading it drains the stream;
+    /// the drain must pass over the DATACLASSIFICATION tokens too.
+    #[tokio::test]
+    async fn close_query_drains_past_data_classification_tokens() {
+        use crate::token::data_classification::{
+            DataClassificationMetadata, DataClassificationVersion,
+        };
+        fn classification() -> Tokens {
+            Tokens::DataClassification(DataClassificationMetadata {
+                version: DataClassificationVersion::Version1,
+                sensitivity_labels: Vec::new(),
+                information_types: Vec::new(),
+                rank: None,
+                columns: Vec::new(),
+            })
+        }
+
+        let mut client = create_test_client_with_tokens(vec![
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, true),
+            int_col_metadata(1),
+            classification(),
+            done_count(CurrentCommand::Select, 0, false),
+        ]);
+
+        assert_eq!(
+            client.execute("q".to_string(), ()).await.unwrap(),
+            StatementResult::Rows
+        );
+        client.close_query().await.unwrap();
+
+        assert!(!client.has_open_batch());
+        assert!(!client.is_connection_dead());
     }
 
     /// Under `Continue` one error can be reflected by both the failing
@@ -19319,18 +19549,23 @@ mod tests {
             client.prepared_handles.insert(old_id, 77);
             let mut orphaned = Some(old_id);
             let offset = sent.lock().unwrap().len();
+            let cancel = CancelHandle::new();
             client
                 .begin_execute_prepared(
                     &mut statement,
                     vec![streamed_varbinary("@v")],
                     &mut orphaned,
-                    ExecuteOptions::new().timeout_secs(1),
+                    ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
                 )
                 .await
                 .unwrap();
             assert!(orphaned.is_none());
             assert!(!client.prepared_handles.contains_key(&old_id));
             assert_eq!(statement.id(), Some(live_id));
+            assert!(
+                client.cancel_handle.is_some(),
+                "unprepare must restore the execution token"
+            );
             assert!(matches!(
                 client
                     .end_execute_prepared_param(&mut statement, &mut orphaned)
@@ -19354,6 +19589,123 @@ mod tests {
             assert!(!wire.windows(4).any(|w| w == [0xFF, 0xFF, 0x0D, 0x00]));
             assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
         }
+    }
+
+    #[tokio::test]
+    async fn internal_unprepare_retains_an_unsent_orphan_on_cancellation() {
+        let (mut client, sent) = create_capturing_client(vec![done_no_more()]);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut orphaned = Some(id);
+        let cancel = CancelHandle::new();
+        cancel.cancel();
+        let error = client
+            .unprepare_orphan(
+                &mut orphaned,
+                ExecuteOptions::new().timeout_secs(1).cancel(&cancel),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(orphaned, Some(id));
+        assert!(client.prepared_handles.contains_key(&id));
+        assert!(sent.lock().unwrap().is_empty());
+        client
+            .unprepare_orphan(&mut orphaned, ExecuteOptions::new())
+            .await
+            .unwrap();
+        assert!(orphaned.is_none());
+        assert!(!client.prepared_handles.contains_key(&id));
+        assert!(client.cancel_handle.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn internal_unprepare_cancellation_bounds_a_stalled_write() {
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let mut transport = TestTransport::new();
+        transport.cancel_during_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let id = client.issue_statement_id();
+        client.prepared_handles.insert(id, 77);
+        let mut orphaned = Some(id);
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.unprepare_orphan(&mut orphaned, ExecuteOptions::new().cancel(&cancel)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert!(
+            orphaned.is_none(),
+            "an attempted release is not safe to resend"
+        );
+        assert!(!client.prepared_handles.contains_key(&id));
+        assert_eq!(sent.lock().unwrap().len(), 8);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transaction_begin_cancellation_bounds_and_retires_a_stalled_write() {
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let mut transport = TestTransport::new();
+        transport.cancel_during_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.begin_transaction_with_options(
+                TransactionIsolationLevel::NoChange,
+                None,
+                ExecuteOptions::new().cancel(&cancel),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert!(!client.has_active_transaction());
+        assert_eq!(sent.lock().unwrap().len(), 8);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn final_streamed_param_retires_unsettled_cancellation() {
+        let mut client = create_test_client_with_transport(TestTransport::with_tokens_then_error(
+            Vec::new(),
+            crate::error::Error::OperationCancelledError("unsettled cancellation".to_string()),
+        ));
+        client
+            .begin_sp_executesql("SELECT @v".to_string(), vec![streamed_varbinary("@v")], ())
+            .await
+            .unwrap();
+        let err = client.end_streamed_param().await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert!(!client.has_open_batch());
+        assert!(client.transport.connection_known_dead());
     }
 
     #[tokio::test]
@@ -19601,14 +19953,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn begin_execute_prepared_release_cancellation_tracks_send_attempt() {
+    async fn begin_execute_prepared_cancels_during_release_without_opening_stream() {
         use crate::security::describe_parameter_encryption::DescribeParameterEncryptionResult;
 
         for send_started in [false, true] {
             let cancel = CancelHandle::new();
             let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
             if send_started {
-                transport.cancel_during_send = Some(cancel.cancel_token.clone());
+                transport.cancel_after_send = Some(cancel.cancel_token.clone());
             } else {
                 transport.cancel_on_writer_creation = Some(cancel.cancel_token.clone());
             }
@@ -19639,12 +19991,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap_err();
-            assert!(matches!(
-                error,
-                crate::error::Error::OperationCancelledError(_)
-            ));
-            assert_eq!(sent.lock().unwrap().len(), if send_started { 8 } else { 0 });
-            assert_eq!(client.is_connection_dead(), send_started);
+            assert!(cancel.cancel_token.is_cancelled());
             assert_eq!(orphaned, if send_started { None } else { Some(id) });
             assert_eq!(client.prepared_handles.contains_key(&id), !send_started);
             assert_eq!(
@@ -19652,24 +19999,25 @@ mod tests {
                 !send_started
             );
             assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            // This scripted reader reports cancellation without acknowledging
+            // ATTENTION. A release already sent cannot leave that link reusable.
+            assert_eq!(client.is_connection_dead(), send_started);
+            assert!(matches!(
                 client.streamed_write_state,
                 StreamedWriteState::Idle
             ));
-            if !send_started {
-                client.unprepare(id, ()).await.unwrap();
-                assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
-                assert!(!client.prepared_handles.contains_key(&id));
-                assert!(client.prepared_param_encryption.is_empty());
-                assert!(!client.is_connection_dead());
-                let bytes = sent.lock().unwrap();
-                assert_eq!(
-                    bytes
-                        .windows(4)
-                        .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
-                        .count(),
-                    1
-                );
-            }
+            assert_eq!(client.prepared_handles.get(&live_id), Some(&99));
+            let bytes = sent.lock().unwrap();
+            assert_eq!(
+                bytes
+                    .windows(4)
+                    .filter(|w| *w == [0xFF, 0xFF, 0x0F, 0x00])
+                    .count(),
+                usize::from(send_started)
+            );
         }
     }
 
@@ -20556,6 +20904,134 @@ mod tests {
                 "request budget {request_budget:?} must not reach the withdrawal"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_cancel_finishes_the_packet_then_withdraws_streamed_data() {
+        for finish_parameter in [false, true] {
+            let mut cancel = CancelHandle::new();
+            cancel.set_cancel_timeout_secs(2);
+            let mut transport = TestTransport::with_tokens(vec![done_no_more()]);
+            transport.send_delay = Some(Duration::from_millis(500));
+            let sent = Arc::clone(&transport.sent);
+            let attentions = Arc::clone(&transport.attentions);
+            let mut client = create_test_client_with_transport(transport);
+            client
+                .begin_sp_executesql(
+                    "SELECT @p".to_string(),
+                    vec![streamed_varbinary("@p")],
+                    ExecuteOptions::new().cancel(&cancel),
+                )
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel.cancel();
+            });
+            let start = tokio::time::Instant::now();
+            let error = if finish_parameter {
+                client.end_streamed_param().await.unwrap_err()
+            } else {
+                client
+                    .write_streamed_chunk(&vec![7; 10_000])
+                    .await
+                    .unwrap_err()
+            };
+            task.await.unwrap();
+            assert!(matches!(
+                error,
+                crate::error::Error::OperationCancelledError(_)
+            ));
+            assert_eq!(start.elapsed(), Duration::from_millis(500));
+            assert!(!client.is_connection_dead());
+            assert!(matches!(
+                client.streamed_write_state,
+                StreamedWriteState::Idle
+            ));
+            let bytes = sent.lock().unwrap();
+            if finish_parameter {
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(bytes[1] & 1, 1);
+            } else {
+                assert_eq!(attentions.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 4], &[3, 3, 0, 8]);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_cancel_retires_a_packet_that_cannot_finish() {
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(1);
+        let mut transport = TestTransport::new();
+        transport.cancel_during_send = Some(cancel.cancel_token.clone());
+        let sent = Arc::clone(&transport.sent);
+        let closes = Arc::clone(&transport.close_calls);
+        let mut client = create_test_client_with_transport(transport);
+        client
+            .begin_sp_executesql(
+                "SELECT @p".to_string(),
+                vec![streamed_varbinary("@p")],
+                ExecuteOptions::new().cancel(&cancel),
+            )
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let error = client
+            .write_streamed_chunk(&vec![7; 10_000])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::OperationCancelledError(_)
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(client.is_connection_dead());
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            8,
+            "no IGNORE, ATTENTION or TLS shutdown after a partial packet"
+        );
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_withdrawal_shares_the_original_cancellation_deadline() {
+        let (mut client, observed) = create_timeout_observing_client(vec![done_no_more()]);
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(3);
+        let message = suspend_message_under(&mut client, 10_000, Some(&cancel)).await;
+        cancel.cancel();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        client.retract_partial_request(message).await;
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![Some(Duration::from_secs(2))]
+        );
+        assert!(!client.is_connection_dead());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_withdrawal_keeps_deadline_when_timeout_is_reset() {
+        let (mut client, observed) = create_timeout_observing_client(vec![done_no_more()]);
+        let mut cancel = CancelHandle::new();
+        cancel.set_cancel_timeout_secs(3);
+        let message = suspend_message_under(&mut client, 10_000, Some(&cancel)).await;
+        cancel.cancel();
+        let deadline = message.cancellation_deadline().unwrap();
+        cancel.set_cancel_timeout_secs(0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(message.cancellation_deadline(), Some(deadline));
+        assert!(matches!(
+            message.check_cancellation(),
+            Err(crate::error::Error::OperationCancelledError(_))
+        ));
+        client.retract_partial_request(message).await;
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![Some(Duration::from_secs(2))]
+        );
+        assert!(!client.is_connection_dead());
     }
 
     /// A parked streamed write owns the connection until it closes. A second

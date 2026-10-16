@@ -43,15 +43,17 @@ pub(crate) unsafe fn sql_put_data(
     data_ptr: SqlPointer,
     strlen_or_ind: SqlLen,
 ) -> SqlReturn {
-    debug!(
-        ?statement_handle,
-        ?data_ptr,
-        strlen_or_ind,
-        "SQLPutData called"
-    );
-    crate::ffi_entry!("SQLPutData", unsafe {
-        sql_put_data_impl(statement_handle, data_ptr, strlen_or_ind)
-    })
+    crate::ffi_entry!(
+        "SQLPutData",
+        statement_handle,
+        debug!(
+            ?statement_handle,
+            ?data_ptr,
+            strlen_or_ind,
+            "SQLPutData called"
+        ),
+        unsafe { sql_put_data_impl(statement_handle, data_ptr, strlen_or_ind) }
+    )
 }
 
 /// # Safety
@@ -107,6 +109,22 @@ unsafe fn nts_byte_count(data_ptr: SqlPointer, c_type: i16) -> usize {
 /// `SQL_NTS`, it must be non-null and readable through a NUL terminator as the
 /// currently bound C type.
 unsafe fn sql_put_data_safe(
+    statement_handle: SqlHandle,
+    stmt: &StmtHandle,
+    data_ptr: SqlPointer,
+    strlen_or_ind: SqlLen,
+) -> SqlReturn {
+    let operation = match stmt.begin_operation() {
+        Ok(operation) => operation,
+        Err(rc) => return rc,
+    };
+    let rc = unsafe { sql_put_data_operation(statement_handle, stmt, data_ptr, strlen_or_ind) };
+    super::exec_common::finish_operation(operation, stmt, statement_handle, rc)
+}
+
+/// # Safety
+/// The handle and application buffer satisfy `sql_put_data_safe`'s contract.
+unsafe fn sql_put_data_operation(
     statement_handle: SqlHandle,
     stmt: &StmtHandle,
     data_ptr: SqlPointer,

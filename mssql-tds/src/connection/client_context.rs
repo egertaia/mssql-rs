@@ -725,6 +725,15 @@ impl ClientContext {
     ///
     /// This is used when setting up SSPI/GSSAPI authentication.
     pub fn integrated_auth_config(&self) -> IntegratedAuthConfig {
+        self.integrated_auth_config_for(&self.transport_context)
+    }
+
+    /// Like [`Self::integrated_auth_config`], but for the endpoint being dialled,
+    /// which differs from `self.transport_context` after a routing redirect.
+    pub(crate) fn integrated_auth_config_for(
+        &self,
+        transport_context: &TransportContext,
+    ) -> IntegratedAuthConfig {
         IntegratedAuthConfig {
             server_spn: self.server_spn.clone(),
             security_package: Default::default(),
@@ -732,7 +741,7 @@ impl ClientContext {
             // engine's channel binding token (see
             // `NetworkWriter::channel_binding_token`).
             channel_bindings: None,
-            is_loopback: self.transport_context.is_loopback(),
+            is_loopback: transport_context.is_loopback(),
         }
     }
 
@@ -1259,6 +1268,20 @@ impl TransportContext {
 #[allow(deprecated)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_integrated_auth_config_for_uses_dialled_endpoint() {
+        let mut ctx = ClientContext::with_data_source("tcp:sql.contoso.com,1433");
+        ctx.parse_datasource("tcp:sql.contoso.com,1433").unwrap();
+        let routed = TransportContext::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 1434,
+            instance_name: None,
+        };
+
+        assert!(!ctx.integrated_auth_config().is_loopback);
+        assert!(ctx.integrated_auth_config_for(&routed).is_loopback);
+    }
 
     #[test]
     fn test_with_data_source_constructor() {

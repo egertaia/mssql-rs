@@ -706,11 +706,7 @@ impl LoginHandler<'_> {
 
         // If using integrated security, create SSPI handler and get initial token
         let (sspi_token, sspi_handler) = if is_integrated_security {
-            // `context` still describes the original endpoint after a routing
-            // redirect, so take loopback from this attempt's transport.
-            let mut config = context
-                .integrated_auth_config()
-                .with_loopback(transport_context.is_loopback());
+            let mut config = context.integrated_auth_config_for(transport_context);
 
             // Bind the authentication exchange to the TLS channel (Extended
             // Protection for Authentication). The token is only present when

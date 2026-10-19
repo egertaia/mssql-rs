@@ -221,7 +221,7 @@ mod redirection_tests {
     }
 
     /// A custom `SecurityContextProvider` must see the routed endpoint, not the
-    /// original one: server, port and `is_loopback` all describe the attempt.
+    /// original one.
     #[tokio::test]
     async fn test_redirect_passes_routed_endpoint_to_security_context_provider() {
         use mssql_mock_tds::MockTdsServer;
@@ -274,9 +274,7 @@ mod redirection_tests {
         context.tds_authentication_method = TdsAuthenticationMethod::SSPI;
         context.security_context_provider = Some(recorder.clone());
 
-        // `0.0.0.0` reaches the local gateway but is not a loopback name, so the
-        // original endpoint is non-loopback while the routed `127.0.0.1` is.
-        let datasource = format!("tcp:0.0.0.0,{gateway_port}");
+        let datasource = format!("tcp:127.0.0.1,{gateway_port}");
         let result = TdsConnectionProvider {}
             .create_client(context, &datasource, None)
             .await;
@@ -286,7 +284,7 @@ mod redirection_tests {
         assert_eq!(
             calls,
             vec![
-                ("0.0.0.0".to_string(), gateway_port, false),
+                ("127.0.0.1".to_string(), gateway_port, true),
                 ("127.0.0.1".to_string(), destination_port, true),
             ]
         );

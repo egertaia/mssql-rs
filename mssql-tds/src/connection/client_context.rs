@@ -725,25 +725,6 @@ impl ClientContext {
     ///
     /// This is used when setting up SSPI/GSSAPI authentication.
     pub fn integrated_auth_config(&self) -> IntegratedAuthConfig {
-        let is_loopback = match &self.transport_context {
-            TransportContext::Tcp { host, .. } => is_loopback_address(host),
-            // For named pipes, extract server from pipe_name (\\server\pipe\...)
-            TransportContext::NamedPipe { pipe_name } => {
-                // Extract server from \\server\pipe\... format
-                let server = pipe_name
-                    .trim_start_matches("\\\\")
-                    .split('\\')
-                    .next()
-                    .unwrap_or(".");
-                is_loopback_address(server)
-            }
-            // Shared memory is always local
-            TransportContext::SharedMemory { .. } => true,
-            // LocalDB is always local
-            #[cfg(windows)]
-            TransportContext::LocalDB { .. } => true,
-        };
-
         IntegratedAuthConfig {
             server_spn: self.server_spn.clone(),
             security_package: Default::default(),
@@ -751,7 +732,7 @@ impl ClientContext {
             // engine's channel binding token (see
             // `NetworkWriter::channel_binding_token`).
             channel_bindings: None,
-            is_loopback,
+            is_loopback: self.transport_context.is_loopback(),
         }
     }
 
@@ -997,6 +978,28 @@ pub enum TransportContext {
 }
 
 impl TransportContext {
+    /// Whether this endpoint is the local machine.
+    pub(crate) fn is_loopback(&self) -> bool {
+        match self {
+            TransportContext::Tcp { host, .. } => is_loopback_address(host),
+            // For named pipes, extract server from pipe_name (\\server\pipe\...)
+            TransportContext::NamedPipe { pipe_name } => {
+                // Extract server from \\server\pipe\... format
+                let server = pipe_name
+                    .trim_start_matches("\\\\")
+                    .split('\\')
+                    .next()
+                    .unwrap_or(".");
+                is_loopback_address(server)
+            }
+            // Shared memory is always local
+            TransportContext::SharedMemory { .. } => true,
+            // LocalDB is always local
+            #[cfg(windows)]
+            TransportContext::LocalDB { .. } => true,
+        }
+    }
+
     /// Create a TCP TransportContext from a routing token.
     ///
     /// Routing tokens can legitimately contain both `host\instance` and a port,

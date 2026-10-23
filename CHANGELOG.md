@@ -12,6 +12,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   `ClientContext::security_context_provider` to replace the built-in
   SSPI/GSSAPI context for integrated auth, e.g. NTLM on Linux/macOS (#707).
 
+- Shared MultiSubnetFailover (MSF) startup configuration: explicit connection
+  setting > application default > `MSSQL_RS_MULTISUBNET_FAILOVER_DEFAULT`
+  (`true`/`false`) > built-in on. Rust, native Python, and Node.js expose
+  startup setters; the CLI accepts `--multi-subnet-failover true|false`.
+  Defaults freeze on first use; late setters fail. Connection policy and its
+  source are traced and retained for recovery and secondary connections
+  (AB#49293).
+
+- `mssql-odbc`: `SQL_COPT_SS_MULTISUBNET_FAILOVER` accepts off/on before
+  connecting, overrides the matching keyword, and reports the connection's
+  effective policy. Out-of-range values are `HY024`; changes while connected
+  are `HY011` (AB#49293).
+
 - `mssql-odbc`: `SQLGetData` conversions from `varchar(max)` and `nvarchar(max)`
   into supported numeric and date/time C targets, with the existing
   bound-fetch 1 MiB source-data cap (AB#47238).
@@ -62,9 +75,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   columns, allowing Polars DataFrames to load without first converting the
   DataFrame to a PyArrow table.
 
+- `mssql-tds`: DNS caching. LOGIN7 always advertises feature extension `0x0B`,
+  as msodbcsql does. When a server acknowledges it, the addresses that
+  connection resolved are kept in a process-wide cache and used only if a
+  later resolution of that host fails, so connections survive a DNS outage.
+  Verdicts take effect only after LOGINACK and a successful terminal DONE.
+  A FEATUREEXTACK without a positive DNS acknowledgement removes the host;
+  a rejected or incomplete response, or one with no FEATUREEXTACK at all,
+  leaves the cache unchanged (AB#49294).
+
+- `mssql-tds`: Enhanced Routing. LOGIN7 always advertises feature extension
+  `0x0F`, as msodbcsql does, and the client follows ENVCHANGE type 21 to the
+  routed server and logs in to the routed database. A type 21 route without
+  an Enhanced Routing acknowledgement of 1 fails the login, matching msodbcsql
+  (AB#49295).
+
 - Initial public release of the mssql-rs workspace.
 
 ### Changed
+
+- Eligible TCP connections now default to immediate parallel MSF attempts,
+  without TNIR's first-address phase. Explicit non-TCP transports, failover
+  partners, and named instances requiring SSRP suppress an inherited on
+  default; Windows local targets without a protocol or port retain their
+  shared-memory-first path unless MSF is explicitly enabled for the connection.
+  Explicitly enabling incompatible MSF is an error. More than 64
+  resolved addresses is an error with MSF on, not a truncated race; MSF off
+  walks the full list sequentially. See parity decisions 34 and 35 (AB#49293).
+
+- Rust API migration: `ClientContext::multi_subnet_failover` is now
+  `Option<bool>`: use `None` to inherit, or `Some(false)` to opt out.
+  Python dictionary and JS object options preserve omission and explicit false.
+  Native Python `multi_subnet_failover=None` also inherits the default.
+
+- TNIR is deliberately unsupported. ODBC
+  `TransparentNetworkIPResolution=Disabled` / `SQL_COPT_SS_TNIR=OFF` and native
+  Python `False` / `"Disabled"` are compatibility no-ops, **not MSF opt-outs**.
+  Enabling TNIR returns `HYC00` in ODBC or an exception in native Python;
+  malformed values are rejected. Use `MultiSubnetFailover=No` or the equivalent
+  native option to select sequential connections (AB#49293).
+
+- `mssql-tds`: `Error::Redirection` has a new `database` field, set when the
+  server routes the connection with Enhanced Routing. Routing ENVCHANGEs are
+  now acted on after the whole login response is read rather than mid-stream.
+  A routing ENVCHANGE (type 20 or 21) must follow LOGINACK and be the only one
+  in the login response ([MS-TDS] 2.2.7.9); otherwise the login fails with a
+  protocol error instead of following a route, matching msodbcsql.
+  Both routing types now validate the token and routing-data lengths, empty
+  old value, TCP protocol, non-zero port, and bounded server name before
+  continuing to the next token. A malformed or truncated response after the
+  routing token fails the login instead of being skipped (AB#49294).
 
 - `mssql-odbc`: empty character values retrieved as numeric or GUID C targets
   now return success with indicator 0 and leave the value buffer unchanged,
@@ -137,6 +197,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- `mssql-tds`: a parallel TCP connect now aborts its remaining attempts when it is cancelled
+  or the login deadline expires. Before, those attempts kept their sockets
+  open until the OS connect timeout (AB#49293).
+
+- `mssql-odbc`: `SQLGetConnectAttr` now writes the four-byte width of an
+  integer attribute to `StringLengthPtr`, as msodbcsql does. Before, the
+  caller's variable was left unchanged (AB#49293).
+
+- `mssql-tds`: a route received over shared memory, the first transport tried
+  for a local named instance, is now followed over TCP like a route received
+  over any other transport. The connection previously failed with
+  `Error::Redirection`. A failed routed connection now returns the target's
+  error without retrying the gateway or falling back to SSRP, matching
+  msodbcsql. Retries before receiving a route are unchanged.
+
+- `mssql-tds`: the crates.io README quick start now uses the current
+  `execute(sql, ())` / `on_rows()` / `next_row()` API, both feature tables list
+  the `tls-schannel-direct` features, and the dependency snippet points at
+  `0.3`. The bulk copy docs now show `BulkLoadRow` and
+  `write_to_server_zerocopy` instead of the removed `BulkCopyRow` and
+  `write_to_server`. docs.rs now also builds the Windows target, and broken or
+  private intra-doc links no longer render as dead text. The `mssql-mock-tds`
+  README examples use the current `create_client` and `execute` signatures.
+
 - `mssql-tds` and bindings: an `IMAGE` value with a present text pointer and a
   zero payload length now decodes as empty instead of NULL (AB#49220). In the
   legacy LOB wire format NULL is a zero *text-pointer* length; the decoder
@@ -146,6 +230,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   `mssql-odbc` reports indicator `0` rather than `SQL_NULL_DATA` (matching
   msodbcsql), `mssql-py-core` returns `b""` rather than `None`, and `mssql-js`
   returns an empty `Buffer` rather than `null`. A genuine NULL is unchanged.
+
+- `mssql-odbc`: a statement that finds a shared, non-MARS connection in use now
+  always fails with `HY000` "Connection is busy with results for another
+  command", matching msodbcsql. Racing a cursor close or a connection-scoped
+  operation (`SQLEndTran`, autocommit/isolation/catalog changes, the
+  `SQL_USER_NAME` lookup) could instead report "No active TDS client", which
+  applications do not retry (AB#49225).
 
 - `mssql-tds` / `mssql-odbc`: a character with no representation in the narrow
   encoding a value is sent in is now replaced with `?` instead of being
